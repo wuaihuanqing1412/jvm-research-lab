@@ -22,11 +22,11 @@ jobs:
 
       - name: Setup dependencies and JDK classes
         shell: powershell
-        run: ./scripts/setup.ps1 -JdkHome $env:JAVA_HOME
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup.ps1 -JdkHome $env:JAVA_HOME
 
       - name: Build Java harness
         shell: powershell
-        run: ./scripts/build.ps1 -JdkHome $env:JAVA_HOME
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -JdkHome $env:JAVA_HOME
 
       - name: Run Mixin acceptance
         shell: powershell
