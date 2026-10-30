@@ -117,6 +117,19 @@ real mixin RETURN
 42
 ```
 
+## Demo (local, class-file based)
+
+There is **no hosted source editor yet**. The current playground runs precompiled class files.
+
+```powershell
+node scripts/serve.mjs
+# http://127.0.0.1:5193/
+```
+
+Selected pages: `real.html`, `list.html`, `str.html`, `exception.html`, `generic.html`, `anno.html`, `transform.html`, `node.html`, `srg.html`, `modern.html`, `pngindex.html`.
+
+See [`docs/demo.md`](docs/demo.md) for the full list and current limitations. A future source playground requires either server-side compilation or an in-browser Java compiler; neither is implemented.
+
 > The `lab/` directory was originally an internal playground. Some legacy pages are still useful, but only the Mixin harness is treated as a stable test in this phase.
 
 ## Repository layout

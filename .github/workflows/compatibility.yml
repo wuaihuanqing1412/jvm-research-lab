@@ -1,0 +1,38 @@
+name: compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  mixin-harness:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup dependencies and JDK classes
+        shell: powershell
+        run: ./scripts/setup.ps1 -JdkHome $env:JAVA_HOME
+
+      - name: Build Java harness
+        shell: powershell
+        run: ./scripts/build.ps1 -JdkHome $env:JAVA_HOME
+
+      - name: Run Mixin acceptance
+        shell: powershell
+        run: |
+          $out = node lab/run-realmixin.mjs
+          $out | Write-Host
+          if (-not ($out -match "real mixin HEAD")) { throw "missing HEAD callback" }
+          if (-not ($out -match "real mixin RETURN")) { throw "missing RETURN callback" }
+          if (-not ($out -match "42")) { throw "missing original return value" }
