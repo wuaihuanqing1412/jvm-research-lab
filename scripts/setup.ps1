@@ -37,7 +37,7 @@ function Expand-Classes([string]$Jar, [string]$Target) {
 $deps = @(
   @{ Name = "asm-9.8.jar";       Url = "https://repo1.maven.org/maven2/org/ow2/asm/asm/9.8/asm-9.8.jar";             Dir = "asm" },
   @{ Name = "asm-tree-9.8.jar";  Url = "https://repo1.maven.org/maven2/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar";   Dir = "asm" },
-  @{ Name = "mixin-0.8.5.jar";   Url = "https://maven.minecraftforge.net/org/spongepowered/mixin/0.8.5/mixin-0.8.5.jar"; Dir = "mixin" },
+  @{ Name = "mixin-0.8.5.jar";   Url = "https://repo.spongepowered.org/repository/maven-public/org/spongepowered/mixin/0.8.5/mixin-0.8.5.jar"; Dir = "mixin" },
   @{ Name = "guava-31.1-jre.jar"; Url = "https://repo1.maven.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar"; Dir = "guava" },
   @{ Name = "gson-2.10.jar";     Url = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10/gson-2.10.jar"; Dir = "gson" }
 )
