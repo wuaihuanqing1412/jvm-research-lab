@@ -46,7 +46,10 @@ foreach ($dep in $deps) {
   $jar = Join-Path $Vendor $dep.Name
   if (-not (Test-Path $jar)) {
     Write-Host "download $($dep.Name)"
-    Invoke-WebRequest -Uri $dep.Url -OutFile $jar -UseBasicParsing -TimeoutSec 90
+    & curl.exe -L --fail --retry 3 --connect-timeout 20 --max-time 180 -o $jar $dep.Url
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $jar)) {
+      throw "failed to download $($dep.Url)"
+    }
   }
   $target = Join-Path $Lab $dep.Dir
   if (-not (Test-Path $target)) { New-Item -ItemType Directory -Force -Path $target | Out-Null }
