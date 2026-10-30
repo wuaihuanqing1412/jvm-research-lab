@@ -37,7 +37,7 @@ function Expand-Classes([string]$Jar, [string]$Target) {
 $deps = @(
   @{ Name = "asm-9.8.jar";       Url = "https://repo1.maven.org/maven2/org/ow2/asm/asm/9.8/asm-9.8.jar";             Dir = "asm" },
   @{ Name = "asm-tree-9.8.jar";  Url = "https://repo1.maven.org/maven2/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar";   Dir = "asm" },
-  @{ Name = "mixin-0.8.5.jar";   Url = "https://repo1.maven.org/maven2/org/spongepowered/mixin/0.8.5/mixin-0.8.5.jar"; Dir = "mixin" },
+  @{ Name = "mixin-0.8.5.jar";   Url = "https://maven.minecraftforge.net/org/spongepowered/mixin/0.8.5/mixin-0.8.5.jar"; Dir = "mixin" },
   @{ Name = "guava-31.1-jre.jar"; Url = "https://repo1.maven.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar"; Dir = "guava" },
   @{ Name = "gson-2.10.jar";     Url = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10/gson-2.10.jar"; Dir = "gson" }
 )
@@ -72,23 +72,20 @@ $jmods = Join-Path $JdkHome "jmods"
 $jdkTarget = Join-Path $Lab "jdk\classes"
 New-Item -ItemType Directory -Force -Path $jdkTarget | Out-Null
 
-foreach ($module in @("java.base.jmod", "java.logging.jmod")) {
+foreach ($module in @("java.base.jmod", "java.logging.jmod", "jdk.unsupported.jmod")) {
   $jmod = Join-Path $jmods $module
   if (-not (Test-Path $jmod)) { throw "Missing $jmod" }
-  Add-Type -AssemblyName System.IO.Compression.FileSystem
-  $zip = [System.IO.Compression.ZipFile]::OpenRead($jmod)
+  $tmp = Join-Path $env:TEMP ("jmod-" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
-    foreach ($entry in $zip.Entries) {
-      if (-not $entry.FullName.StartsWith("classes/")) { continue }
-      if (-not $entry.FullName.EndsWith(".class")) { continue }
-      $relative = $entry.FullName.Substring("classes/".Length)
-      $dest = Join-Path $jdkTarget $relative
-      $dir = Split-Path $dest -Parent
-      if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-      [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+    & (Join-Path $JdkHome "bin\jmod.exe") extract --dir $tmp $jmod
+    if ($LASTEXITCODE -ne 0) { throw "jmod extract failed for $module" }
+    $classes = Join-Path $tmp "classes"
+    if (Test-Path $classes) {
+      Copy-Item (Join-Path $classes "*") $jdkTarget -Recurse -Force
     }
   } finally {
-    $zip.Dispose()
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
   Write-Host "extracted $module"
 }
