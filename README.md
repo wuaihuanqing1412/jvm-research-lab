@@ -1,5 +1,7 @@
 # JVM Research Lab
 
+[![compatibility](https://github.com/wuaihuanqing1412/jvm-research-lab/actions/workflows/compatibility.yml/badge.svg)](https://github.com/wuaihuanqing1412/jvm-research-lab/actions/workflows/compatibility.yml)
+
 **A custom Java class-file runtime and bytecode experimentation environment for the browser.**
 
 JVM Research Lab is a browser-based research project. It parses and executes real Java class files, loads real OpenJDK classes on demand, runs ASM transformations, and experiments with the real SpongePowered Mixin pipeline. It also bridges Java-side OpenGL calls to WebGL.
