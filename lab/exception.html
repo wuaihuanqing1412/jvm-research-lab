@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JVM from scratch · exceptions</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 920px; margin: 56px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 24px; }
+      .meta { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 10px; color: #b9a98c; font-size: 12px; }
+      .meta b { color: #d9ab5e; font-weight: 500; }
+      #trace { color: #7d7364; font-size: 11.5px; margin-bottom: 12px; white-space: pre-wrap; max-height: 130px; overflow: auto; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 16px; min-height: 200px; white-space: pre-wrap; margin: 0; }
+      .err { color: #e06b6b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>JVM from scratch · exceptions</h1>
+      <div class="sub">真实 JDK 的 RuntimeException + try/catch + athrow</div>
+      <div class="meta" id="meta"></div>
+      <div id="trace"></div>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+
+      const out = document.getElementById('out')
+      const meta = document.getElementById('meta')
+      const trace = document.getElementById('trace')
+      const log = (s) => {
+        trace.textContent += s + '\n'
+        trace.scrollTop = trace.scrollHeight
+      }
+
+      const classes = new Map()
+      async function load(name, url) {
+        if (classes.has(name)) return classes.get(name)
+        const res = await fetch(url || './jdk/classes/' + name + '.class')
+        if (!res.ok) throw new Error('cannot load ' + name + ' (' + res.status + ')')
+        const cls = parseClass(await res.arrayBuffer())
+        classes.set(name, cls)
+        return cls
+      }
+
+      ;(async () => {
+        try {
+          await load('ExcTest', './ExcTest.class')
+          let lines = null
+          for (let attempt = 0; attempt < 80; attempt++) {
+            const vm = createVM2([...classes.values()])
+            try {
+              lines = vm.runMain('ExcTest')
+              break
+            } catch (e) {
+              if (e && e.missingClass) {
+                log('load ' + e.missingClass)
+                await load(e.missingClass)
+                continue
+              }
+              throw e
+            }
+          }
+          meta.innerHTML =
+            '<span>classes <b>' + classes.size + '</b></span>' +
+            '<span>source <b>OpenJDK 17</b></span>' +
+            '<span>exceptions <b>on</b></span>'
+          out.textContent = lines ? lines.join('\n') : 'no output'
+        } catch (e) {
+          out.innerHTML = '<span class="err">' + String(e && e.stack ? e.stack : e) + '</span>'
+        }
+      })()
+    </script>
+  </body>
+</html>

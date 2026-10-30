@@ -1,0 +1,1979 @@
+﻿/* VM v2: objects, fields, arrays, StringBuilder, virtual/static dispatch.
+   Still a toy: no exceptions, no GC, no JDK, no threads. */
+
+import { parseClass, methodRef, fieldRef } from './jvm.js'
+
+const PRINTER = { __printer: true }
+const isRef = (v) => v && typeof v === 'object'
+
+function argCount(desc) {
+  const inside = desc.slice(1, desc.indexOf(')'))
+  let n = 0
+  for (let i = 0; i < inside.length; i++) {
+    const c = inside[i]
+    if (c === 'L') {
+      n++
+      i = inside.indexOf(';', i)
+    } else if (c === '[') {
+      n++
+      while (inside[i + 1] === '[') i++
+      if (inside[i + 1] === 'L') i = inside.indexOf(';', i)
+      else i++
+    } else {
+      n++
+    }
+  }
+  return n
+}
+
+function retKind(desc) {
+  const r = desc.slice(desc.indexOf(')') + 1)
+  if (r === 'V') return 'v'
+  if (r[0] === 'L' || r[0] === '[') return 'a'
+  return 'i'
+}
+
+export class MissingClassError extends Error {
+  constructor(name) {
+    super('missing class ' + name)
+    this.missingClass = name
+  }
+}
+
+export function createVM2(classList, resources = {}, hooks = {}, srg = null) {
+  const resourceMap = resources
+  const glHooks = hooks.gl || null
+  const srgMap = srg
+  const recent = []
+  const classObjectCache = new Map()
+  const fieldOffsets = new Map()
+  const hashIds = new WeakMap()
+  let nextHash = 1
+  const pseudoThread = { __class: 'java/lang/Thread' }
+  const pseudoModule = { __class: 'java/lang/Module', __name: '', __layer: null }
+  let nextFieldOffset = 100
+  const classes = new Map()
+  for (const c of classList) classes.set(c.thisName, c)
+  const out = []
+  let steps = 0
+
+  const methodsOf = (cls) => {
+    const m = new Map()
+    for (const method of cls.methods) {
+      method.__owner = cls
+      m.set(method.name + method.desc, method)
+    }
+    return m
+  }
+  const methodCache = new Map()
+  const getMethods = (cls) => {
+    if (!methodCache.has(cls.thisName)) methodCache.set(cls.thisName, methodsOf(cls))
+    return methodCache.get(cls.thisName)
+  }
+
+  function defaultValue(desc) {
+    if (!desc) return null
+    const c = desc[0]
+    if (c === 'Z' || c === 'B' || c === 'C' || c === 'S' || c === 'I') return 0
+    if (c === 'J' || c === 'F' || c === 'D') return 0
+    return null
+  }
+
+  function makeJavaString(text) {
+    const s = String(text)
+    let wide = false
+    for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0xff) wide = true
+    const bytes = []
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i)
+      if (wide) {
+        bytes.push(code & 0xff, code >> 8)
+      } else {
+        bytes.push(code & 0xff)
+      }
+    }
+    return { __class: 'java/lang/String', fields: { value: bytes, coder: wide ? 1 : 0, hash: 0, hashIsZero: false } }
+  }
+
+  function stringValue(v) {
+    if (typeof v === 'string') return v
+    if (!v || v.__class !== 'java/lang/String') return String(v)
+    if (!v.fields) return typeof v.__text === 'string' ? v.__text : ''
+    const bytes = v.fields.value || []
+    const coder = v.fields.coder || 0
+    let out = ''
+    if (coder === 1) {
+      for (let i = 0; i + 1 < bytes.length; i += 2) out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8))
+    } else {
+      for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] & 0xff)
+    }
+    return out
+  }
+
+  function newObject(className) {
+    console.log('ALLOC ' + className)
+    const fields = {}
+    const seen = new Set()
+    let name = className
+    while (name && !seen.has(name)) {
+      seen.add(name)
+      const cls = classes.get(name)
+      if (!cls) break
+      for (const f of cls.fields || []) {
+        if (!(f.name in fields)) fields[f.name] = defaultValue(f.desc)
+      }
+      name = cls.superName
+    }
+    if (className === 'org/spongepowered/asm/mixin/transformer/MixinConfig') { fields.name = makeJavaString('mixins.test.json'); fields.initialised = 0; fields.prepared = 0; fields.visited = 0 }
+    return { __class: className, fields }
+  }
+
+  const initialized = new Set()
+  const initializing = new Set()
+  function isAssignable(actual, target) {
+    if (!actual || !target) return false
+    if (actual === target) return true
+    let name = actual
+    while (name) {
+      const cls = classes.get(name)
+      if (!cls) throw new MissingClassError(name)
+      name = cls.superName
+      if (name === target) return true
+    }
+    return false
+  }
+
+  function findHandler(method, pc, exClass) {
+    const table = method.code.exceptions || []
+    for (const e of table) {
+      if (pc < e.startPc || pc >= e.endPc) continue
+      if (!e.catchType || (exClass && isAssignable(exClass, e.catchType))) return e.handlerPc
+    }
+    return -1
+  }
+
+  function ensureInit(name) {
+    if (initialized.has(name) || initializing.has(name)) return
+    const cls = classes.get(name)
+    if (!cls) return
+    const clinit = getMethods(cls).get('<clinit>()V')
+    if (!clinit) {
+      initialized.add(name)
+      return
+    }
+    initializing.add(name)
+    try {
+      invoke(clinit, null, [])
+    } catch (e) {
+      if (e && e.missingClass) throw e
+      console.warn('clinit failed for ' + name + ': ' + e.message)
+    } finally {
+      initializing.delete(name)
+      initialized.add(name)
+    }
+  }
+
+  let currentMethod = ''
+  function invoke(method, recv, args) {
+    if (!method.code) throw new Error('native method ' + method.name + ' in ' + (method.__owner && method.__owner.thisName) + ' recv=' + (recv && recv.__class) + ' at ' + currentMethod)
+    recent.push((method.__owner && method.__owner.thisName) + '.' + method.name); if (recent.length > 24) recent.shift()
+    const cls = method.__owner
+    const prevMethod = currentMethod
+    currentMethod = cls.thisName + '.' + method.name + method.desc
+    if (method.name !== '<clinit>') ensureInit(cls.thisName)
+    const locals = new Array(Math.max(method.code.maxLocals, args.length + (recv ? 1 : 0)))
+    let base = 0
+    if (recv) locals[base++] = recv
+    for (let i = 0; i < args.length; i++) locals[base + i] = args[i]
+
+    const stack = []
+    const code = method.code.bytes
+    let pc = 0
+    const push = (v) => stack.push(v)
+    const pop = () => stack.pop()
+
+    while (pc < code.length) {
+      if (++steps > 30_000_000) throw new Error('step limit at ' + currentMethod)
+      const opPc = pc
+      const op = code[pc++]
+      try {
+      switch (op) {
+        case 0x02: push(-1); break
+        case 0x03: push(0); break
+        case 0x04: push(1); break
+        case 0x05: push(2); break
+        case 0x06: push(3); break
+        case 0x07: push(4); break
+        case 0x08: push(5); break
+        case 0x09: push(0); break
+        case 0x0a: push(1); break
+        case 0x0e: push(0.0); break
+        case 0x0f: push(1.0); break
+        case 0x0b: push(0.0); break
+        case 0x0c: push(1.0); break
+        case 0x0d: push(2.0); break
+        case 0x10: push((code[pc++] << 24) >> 24); break
+        case 0x11: {
+          const v = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          push((v << 16) >> 16)
+          break
+        }
+        case 0x12: push(constant(cls, code[pc++])); break
+        case 0x13: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          push(constant(cls, idx))
+          break
+        }
+        case 0x14: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          push(constant(cls, idx))
+          break
+        }
+        case 0x01: push(null); break
+
+        case 0x15: push(locals[code[pc++]]); break
+        case 0x1a: push(locals[0]); break
+        case 0x1b: push(locals[1]); break
+        case 0x1c: push(locals[2]); break
+        case 0x1d: push(locals[3]); break
+        case 0x19: push(locals[code[pc++]]); break
+        case 0x17: push(locals[code[pc++]]); break
+        case 0x22: push(locals[0]); break
+        case 0x23: push(locals[1]); break
+        case 0x24: push(locals[2]); break
+        case 0x25: push(locals[3]); break
+        case 0x18: push(locals[code[pc++]]); break
+        case 0x16: push(locals[code[pc++]]); break
+        case 0x1e: push(locals[0]); break
+        case 0x1f: push(locals[1]); break
+        case 0x20: push(locals[2]); break
+        case 0x21: push(locals[3]); break
+        case 0x26: push(locals[0]); break
+        case 0x27: push(locals[1]); break
+        case 0x28: push(locals[2]); break
+        case 0x29: push(locals[3]); break
+        case 0x38: locals[code[pc++]] = pop(); break
+        case 0x39: locals[code[pc++]] = pop(); break
+        case 0x37: locals[code[pc++]] = pop(); break
+        case 0x3f: locals[0] = pop(); break
+        case 0x40: locals[1] = pop(); break
+        case 0x41: locals[2] = pop(); break
+        case 0x42: locals[3] = pop(); break
+        case 0x43: locals[0] = pop(); break
+        case 0x44: locals[1] = pop(); break
+        case 0x45: locals[2] = pop(); break
+        case 0x46: locals[3] = pop(); break
+        case 0x47: locals[0] = pop(); break
+        case 0x48: locals[1] = pop(); break
+        case 0x49: locals[2] = pop(); break
+        case 0x4a: locals[3] = pop(); break
+        case 0x2a: push(locals[0]); break
+        case 0x2b: push(locals[1]); break
+        case 0x2c: push(locals[2]); break
+        case 0x2d: push(locals[3]); break
+        case 0x36: locals[code[pc++]] = pop(); break
+        case 0x3b: locals[0] = pop(); break
+        case 0x3c: locals[1] = pop(); break
+        case 0x3d: locals[2] = pop(); break
+        case 0x3e: locals[3] = pop(); break
+        case 0x3a: locals[code[pc++]] = pop(); break
+        case 0x4b: locals[0] = pop(); break
+        case 0x4c: locals[1] = pop(); break
+        case 0x4d: locals[2] = pop(); break
+        case 0x4e: locals[3] = pop(); break
+
+        case 0x60: { const b = pop(); const a = pop(); push((a + b) | 0); break }
+        case 0x61: { const b = pop(); const a = pop(); push(a + b); break }
+        case 0x62: { const b = pop(); const a = pop(); push(Math.fround(a + b)); break }
+        case 0x63: { const b = pop(); const a = pop(); push(a + b); break }
+        case 0x65: { const b = pop(); const a = pop(); push(a - b); break }
+        case 0x69: { const b = pop(); const a = pop(); push(a * b); break }
+        case 0x67: { const b = pop(); const a = pop(); push(a - b); break }
+        case 0x6b: { const b = pop(); const a = pop(); push(a * b); break }
+        case 0x6f: { const b = pop(); const a = pop(); push(a / b); break }
+        case 0x73: { const b = pop(); const a = pop(); push(a % b); break }
+        case 0x77: push(-pop()); break
+        case 0xaf: { const b = pop(); const a = pop(); push(a / b); break }
+        case 0x6b: { const b = pop(); const a = pop(); push(a / b); break }
+        case 0x6d: { const b = pop(); const a = pop(); push(a % b); break }
+        case 0x71: { const b = pop(); const a = pop(); push(a % b); break }
+        case 0x75: push(-pop()); break
+        case 0x79: { const b = pop(); const a = pop(); push(a << (b & 63)); break }
+        case 0x7b: { const b = pop(); const a = pop(); push(a >> (b & 63)); break }
+        case 0x7d: { const b = pop(); const a = pop(); push(a >>> (b & 63)); break }
+        case 0x7f: { const b = pop(); const a = pop(); push(a & b); break }
+        case 0x81: { const b = pop(); const a = pop(); push(a | b); break }
+        case 0x83: { const b = pop(); const a = pop(); push(a ^ b); break }
+        case 0x64: { const b = pop(); const a = pop(); push((a - b) | 0); break }
+        case 0x66: { const b = pop(); const a = pop(); push(Math.fround(a - b)); break }
+        case 0x68: { const b = pop(); const a = pop(); push((a * b) | 0); break }
+        case 0x6a: { const b = pop(); const a = pop(); push(Math.fround(a * b)); break }
+        case 0x6c: { const b = pop(); const a = pop(); push((a / b) | 0); break }
+        case 0x6e: { const b = pop(); const a = pop(); push(Math.fround(a / b)); break }
+        case 0x70: { const b = pop(); const a = pop(); push(a % b); break }
+        case 0x74: push(-pop()); break
+        case 0x76: push(-pop()); break
+        case 0x86: push(Math.fround(pop() | 0)); break
+        case 0x85: push(pop() | 0); break
+        case 0x87: push(pop() | 0); break
+        case 0x88: push(pop() | 0); break
+        case 0x89: push(pop() | 0); break
+        case 0x8a: push(pop() | 0); break
+        case 0x8e: push(pop() | 0); break
+        case 0x8f: push(pop() | 0); break
+        case 0x91: push((pop() << 24) >> 24); break
+        case 0x92: push(pop() & 0xffff); break
+        case 0x93: push((pop() << 16) >> 16); break
+        case 0x8b: push(pop() | 0); break
+        case 0x8d: push(pop()); break
+        case 0x90: push(Math.fround(pop())); break
+        case 0x78: { const b = pop(); const a = pop(); push(a << (b & 31)); break }
+        case 0x7a: { const b = pop(); const a = pop(); push(a >> (b & 31)); break }
+        case 0x7c: { const b = pop(); const a = pop(); push(a >>> (b & 31)); break }
+        case 0x7e: { const b = pop(); const a = pop(); push(a & b); break }
+        case 0x80: { const b = pop(); const a = pop(); push(a | b); break }
+        case 0x82: { const b = pop(); const a = pop(); push(a ^ b); break }
+        case 0x84: {
+          const idx = code[pc++]
+          const inc = (code[pc++] << 24) >> 24
+          locals[idx] = (locals[idx] + inc) | 0
+          break
+        }
+
+        case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: {
+          const v = pop()
+          const off = (((code[pc] << 8) | code[pc + 1]) << 16) >> 16
+          pc += 2
+          const ok =
+            (op === 0x99 && v === 0) ||
+            (op === 0x9a && v !== 0) ||
+            (op === 0x9b && v < 0) ||
+            (op === 0x9c && v >= 0) ||
+            (op === 0x9d && v > 0) ||
+            (op === 0x9e && v <= 0)
+          if (ok) pc += off - 3
+          break
+        }
+        case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: {
+          const b = pop()
+          const a = pop()
+          const off = (((code[pc] << 8) | code[pc + 1]) << 16) >> 16
+          pc += 2
+          const ok =
+            (op === 0x9f && a === b) ||
+            (op === 0xa0 && a !== b) ||
+            (op === 0xa1 && a < b) ||
+            (op === 0xa2 && a >= b) ||
+            (op === 0xa3 && a > b) ||
+            (op === 0xa4 && a <= b)
+          if (ok) pc += off - 3
+          break
+        }
+        case 0xa7: {
+          const off = (((code[pc] << 8) | code[pc + 1]) << 16) >> 16
+          pc += 2
+          pc += off - 3
+          break
+        }
+        case 0xa5:
+        case 0xa6: {
+          const b = pop()
+          const a = pop()
+          const off = (((code[pc] << 8) | code[pc + 1]) << 16) >> 16
+          pc += 2
+          const ok = op === 0xa5 ? a === b : a !== b
+          if (ok) pc += off - 3
+          break
+        }
+        case 0xc6: { const v = pop(); const off = (((code[pc] << 8) | code[pc + 1]) << 16) >> 16; pc += 2; if (v == null) pc += off - 3; break }
+        case 0xc7: { const v = pop(); const off = (((code[pc] << 8) | code[pc + 1]) << 16) >> 16; pc += 2; if (v != null) pc += off - 3; break }
+
+        case 0xbb: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const name = classNameAt(cls, idx)
+          if (String(name).indexOf('MixinConfig') >= 0) console.log('NEW ' + name)
+          ensureInit(name)
+          push(newObject(name))
+          break
+        }
+        case 0xbc: {
+          const atype = code[pc++]
+          const n = pop()
+          const primitive = atype >= 4 && atype <= 11
+          const arr = new Array(n).fill(primitive ? 0 : null)
+          arr.__array = true
+          push(arr)
+          break
+        }
+        case 0xbd: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const n = pop()
+          const arr = new Array(n).fill(null)
+          arr.__array = true
+          arr.__class = classNameAt(cls, idx)
+          push(arr)
+          break
+        }
+        case 0xbe: { const a = pop(); push(a ? a.length : 0); break }
+        case 0x30: { const i = pop(); const a = pop(); push(a ? a[i] : 0); break }
+        case 0x51: { const v = pop(); const i = pop(); const a = pop(); if (a) a[i] = v; break }
+        case 0x2e:
+        case 0x2f:
+        case 0x31:
+        case 0x33:
+        case 0x34:
+        case 0x35: { const i = pop(); const a = pop(); push(a ? a[i] : 0); break }
+        case 0x4f:
+        case 0x50:
+        case 0x52:
+        case 0x54:
+        case 0x55:
+        case 0x56: { const v = pop(); const i = pop(); const a = pop(); if (a) a[i] = v; break }
+        case 0x32: { const i = pop(); const a = pop(); push(a ? a[i] : 0); break }
+        case 0x53: { const v = pop(); const i = pop(); const a = pop(); if (a) a[i] = v; break }
+
+        case 0xb2: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const f = fieldRef(cls, cls.cp, idx)
+          ensureInit(f.cls)
+          if (f.cls === 'java/lang/System' && f.name === 'out') push(PRINTER)
+          else if (f.name === 'TYPE') {
+            const prim = { 'java/lang/Integer': 'int', 'java/lang/Long': 'long', 'java/lang/Boolean': 'boolean', 'java/lang/Byte': 'byte', 'java/lang/Character': 'char', 'java/lang/Short': 'short', 'java/lang/Float': 'float', 'java/lang/Double': 'double', 'java/lang/Void': 'void' }
+            push(classObject(prim[f.cls] || 'void'))
+          } else if (f.cls === 'org/objectweb/asm/Opcodes' && /^ASM\\d+$/.test(f.name)) push(parseInt(f.name.slice(3), 10) << 16)
+          else push(staticField(f.cls, f.name))
+          break
+        }
+        case 0xb3: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const f = fieldRef(cls, cls.cp, idx)
+          ensureInit(f.cls)
+          setStaticField(f.cls, f.name, pop())
+          break
+        }
+        case 0xb4: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const f = fieldRef(cls, cls.cp, idx)
+          const obj = pop()
+          if (!obj || !obj.fields) throw new Error('bad getfield ' + f.name + ' obj=' + String(obj) + ' in ' + cls.thisName + '.' + method.name)
+          push(obj.fields[f.name])
+          break
+        }
+        case 0xb5: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const f = fieldRef(cls, cls.cp, idx)
+          const v = pop()
+          const obj = pop()
+          obj.fields[f.name] = v
+          break
+        }
+
+        case 0xba: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 4
+          const indy = cls.cp[idx]
+          const nt = cls.cp[indy.b]
+          const desc = cls.cp[nt.b].value
+          const bs = (cls.bootstrapMethods || [])[indy.a]
+          const mh = cls.cp[bs.ref]
+          const target = methodRef(cls, cls.cp, mh.b)
+          const n = argCount(desc)
+          const args = new Array(n)
+          for (let i = n - 1; i >= 0; i--) args[i] = pop()
+          if (target.cls === 'java/lang/invoke/StringConcatFactory') {
+            let recipe = null
+            let constants = []
+            if (bs.args.length) {
+              const first = cls.cp[bs.args[0]]
+              if (first.tag === 8) recipe = cls.cp[first.index].value
+              constants = bs.args.slice(recipe !== null ? 1 : 0).map((i) => constValue(cls, i))
+            }
+            let text = ''
+            if (recipe === null) {
+              text = args.map((a) => stringValue(a)).join('')
+            } else {
+              let ai = 0
+              let ci = 0
+              for (const ch of recipe) {
+                if (ch === '\u0001') text += stringValue(args[ai++])
+                else if (ch === '\u0002') text += stringValue(constants[ci++])
+                else text += ch
+              }
+            }
+            push(makeJavaString(text))
+            break
+          }
+          throw new Error('unsupported invokedynamic ' + target.cls + '.' + target.name)
+        }
+
+        case 0xb8: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const ref = methodRef(cls, cls.cp, idx)
+          const n = argCount(ref.desc)
+          const args = new Array(n)
+          for (let i = n - 1; i >= 0; i--) args[i] = pop()
+          if (ref.cls === 'java/lang/Integer' && ref.name === 'valueOf') {
+            push({ __int: args[0] })
+            break
+          }
+          if (ref.cls === 'java/util/Objects' && ref.name === 'checkIndex') {
+            if (args[0] < 0 || args[0] >= args[1]) throw new Error('IndexOutOfBounds ' + args[0] + ' at ' + currentMethod + ' recent=' + recent.slice(-10).join(' <- '))
+            push(args[0])
+            break
+          }
+          const native = nativeCall(ref, null, args)
+          if (native.handled) {
+            if (retKind(ref.desc) !== 'v') push(native.value)
+            break
+          }
+          const target = resolveMethod(ref, null)
+          const result = invoke(target.method, null, args)
+          if (retKind(ref.desc) !== 'v') push(result)
+          break
+        }
+        case 0xb6:
+        case 0xb9: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          if (op === 0xb9) pc += 2
+          const ref = methodRef(cls, cls.cp, idx)
+          const n = argCount(ref.desc)
+          const args = new Array(n)
+          for (let i = n - 1; i >= 0; i--) args[i] = pop()
+          const recv = pop()
+          if (ref.cls === 'org/objectweb/asm/ClassReader' && ref.name === 'accept') out.push('ACCEPT flags=' + args[1] + ' typeof=' + typeof args[1])
+          if (recv && recv.__annotation) {
+            const value = recv.__values[ref.name]
+            push(typeof value === 'string' ? makeJavaString(value) : value)
+            break
+          }
+          if (ref.cls === 'java/io/PrintStream' && recv === PRINTER) {
+            out.push(stringValue(args[0]))
+            break
+          }
+          if (recv && recv.__int !== undefined && ref.name === 'intValue') {
+            push(recv.__int)
+            break
+          }
+          const native = nativeCall(ref, recv, args)
+          if (native.handled) {
+            if (retKind(ref.desc) !== 'v') push(native.value)
+            break
+          }
+          const target = resolveMethod(ref, recv)
+          const result = invoke(target.method, recv, args)
+          if (retKind(ref.desc) !== 'v') push(result)
+          break
+        }
+        case 0xb7: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const ref = methodRef(cls, cls.cp, idx)
+          const n = argCount(ref.desc)
+          const args = new Array(n)
+          for (let i = n - 1; i >= 0; i--) args[i] = pop()
+          const recv = pop()
+          if (ref.cls === 'java/lang/Object' && ref.name === '<init>') break
+          const native = nativeCall(ref, recv, args)
+          if (native.handled) break
+          const target = resolveMethod(ref, recv, true)
+          const result = invoke(target.method, recv, args)
+          if (retKind(ref.desc) !== 'v') push(result)
+          break
+        }
+
+        case 0x57: pop(); break
+        case 0x59: { const v = pop(); push(v); push(v); break }
+        case 0x5a: {
+          const v1 = pop()
+          const v2 = pop()
+          push(v1)
+          push(v2)
+          push(v1)
+          break
+        }
+        case 0x5b: {
+          const v1 = pop()
+          const v2 = pop()
+          const v3 = pop()
+          push(v1)
+          push(v3)
+          push(v2)
+          push(v1)
+          break
+        }
+        case 0x5c: {
+          const b = pop()
+          const a = pop()
+          push(a)
+          push(b)
+          push(a)
+          push(b)
+          break
+        }
+        case 0x5d: {
+          const c = pop()
+          const b = pop()
+          const a = pop()
+          push(b)
+          push(c)
+          push(a)
+          push(b)
+          push(c)
+          break
+        }
+        case 0x5e: {
+          const b = pop()
+          const a = pop()
+          push(a)
+          push(b)
+          push(a)
+          push(b)
+          break
+        }
+        case 0xc0: {
+          pc += 2
+          break
+        }
+        case 0xc1: {
+          const idx = (code[pc] << 8) | code[pc + 1]
+          pc += 2
+          const target = classNameAt(cls, idx)
+          const v = pop()
+          let ok = 0
+          if (v && v.__class) {
+            try {
+              ok = isAssignable(v.__class, target) ? 1 : 0
+            } catch (e) {
+              ok = 0
+            }
+          }
+          push(ok)
+          break
+        }
+        case 0xaa: {
+          let p = pc
+          p += (4 - (p % 4)) % 4
+          const read4 = (q) => (code[q] << 24) | (code[q + 1] << 16) | (code[q + 2] << 8) | code[q + 3]
+          const def = read4(p)
+          p += 4
+          const low = read4(p)
+          const high = read4(p + 4)
+          p += 8
+          const key = pop()
+          let rel = def
+          if (key >= low && key <= high) rel = read4(p + (key - low) * 4)
+          pc = opPc + rel
+          break
+        }
+        case 0xab: {
+          let p = pc
+          p += (4 - (p % 4)) % 4
+          const read4 = (q) => (code[q] << 24) | (code[q + 1] << 16) | (code[q + 2] << 8) | code[q + 3]
+          const def = read4(p)
+          p += 4
+          const n = read4(p)
+          p += 4
+          const key = pop()
+          let rel = def
+          for (let i = 0; i < n; i++) {
+            const match = read4(p + i * 8)
+            if (match === key) {
+              rel = read4(p + i * 8 + 4)
+              break
+            }
+          }
+          pc = opPc + rel
+          break
+        }
+        case 0x94: {
+          const b = pop()
+          const a = pop()
+          push(a > b ? 1 : a < b ? -1 : 0)
+          break
+        }
+        case 0x95:
+        case 0x96: {
+          const b = pop()
+          const a = pop()
+          let r
+          if (Number.isNaN(a) || Number.isNaN(b)) r = op === 0x95 ? -1 : 1
+          else r = a > b ? 1 : a < b ? -1 : 0
+          push(r)
+          break
+        }
+        case 0x97:
+        case 0x98: {
+          const b = pop()
+          const a = pop()
+          let r
+          if (Number.isNaN(a) || Number.isNaN(b)) r = op === 0x97 ? -1 : 1
+          else r = a > b ? 1 : a < b ? -1 : 0
+          push(r)
+          break
+        }
+        case 0xc2:
+        case 0xc3: {
+          pop()
+          break
+        }
+        case 0xbf: {
+          throw { __jvm: true, value: pop(), where: currentMethod }
+        }
+        case 0xac: {
+          const ret = pop()
+          if (typeof ret !== 'number') throw new Error('IRETURN type mismatch: got ' + (ret && ret.__class ? ret.__class : typeof ret) + ' at ' + currentMethod + ' recent=' + recent.slice(-10).join(' <- '))
+          return ret
+        }
+        case 0xad: return pop()
+        case 0xae: return pop()
+        case 0xb0: return pop()
+        case 0xb1: currentMethod = prevMethod; return undefined
+        default:
+          throw new Error('unsupported opcode 0x' + op.toString(16) + ' in ' + cls.thisName + '.' + method.name)
+      }
+      } catch (err) {
+        if (err && err.__jvm) {
+          const handler = findHandler(method, opPc, err.value && err.value.__class)
+          if (handler >= 0) {
+            stack.length = 0
+            push(err.value)
+            pc = handler
+            continue
+          }
+        }
+        throw err
+      }
+    }
+    return undefined
+  }
+
+  const staticFields = new Map()
+  for (const cls of classList) {
+    for (const f of cls.fields || []) {
+      if (f.access & 0x0008) staticFields.set(cls.thisName + '.' + f.name, defaultValue(f.desc))
+    }
+  }
+  function staticField(clsName, name) {
+    return staticFields.get(clsName + '.' + name)
+  }
+  function setStaticField(clsName, name, value) {
+    staticFields.set(clsName + '.' + name, value)
+  }
+
+  function classNameAt(cls, idx) {
+    const c = cls.cp[idx]
+    return cls.cp[c.index].value
+  }
+
+  function lookupMethod(name, key, seen) {
+    if (!name || seen.has(name)) return null
+    seen.add(name)
+    const cls = classes.get(name)
+    if (!cls) throw new MissingClassError(name)
+    const method = getMethods(cls).get(key)
+    if (method) return { cls, method }
+    const viaSuper = lookupMethod(cls.superName, key, seen)
+    if (viaSuper) return viaSuper
+    for (const iface of cls.interfaceNames || []) {
+      const found = lookupMethod(iface, key, seen)
+      if (found) return found
+    }
+    return null
+  }
+
+  function alternateMember(owner, name, desc, isField) {
+    if (!srgMap || !owner) return null
+    const cls = srgMap[owner]
+    if (!cls) return null
+    if (!isField) {
+      const key = name + ' ' + desc
+      if (cls.m && cls.m[key]) return cls.m[key]
+      if (cls.m) {
+        for (const k of Object.keys(cls.m)) {
+          if (cls.m[k] === name && k.endsWith(' ' + desc)) return k.slice(0, k.length - desc.length - 1)
+        }
+      }
+    } else {
+      if (cls.f && cls.f[name]) return cls.f[name]
+      if (cls.f) {
+        for (const k of Object.keys(cls.f)) {
+          if (cls.f[k] === name) return k
+        }
+      }
+    }
+    return null
+  }
+
+  function resolveMethod(ref, recv, exact = false) {
+    const key = ref.name + ref.desc
+    if (exact) {
+      const cls = classes.get(ref.cls)
+      if (!cls) throw new MissingClassError(ref.cls)
+      const method = getMethods(cls).get(key)
+      if (method) return { cls, method }
+      throw new Error('no method ' + ref.cls + '.' + key)
+    }
+    const start = recv && recv.__class ? recv.__class : ref.cls
+    const found = lookupMethod(start, key, new Set())
+    if (found) return found
+    const refCls = classes.get(ref.cls)
+    if (!refCls) throw new MissingClassError(ref.cls)
+    const viaRef = lookupMethod(ref.cls, key, new Set())
+    if (viaRef) return viaRef
+    const alt = alternateMember(start, ref.name, ref.desc, false) || alternateMember(ref.cls, ref.name, ref.desc, false)
+    if (alt) {
+      const viaAlt = lookupMethod(start, alt + ref.desc, new Set()) || lookupMethod(ref.cls, alt + ref.desc, new Set())
+      if (viaAlt) return viaAlt
+    }
+    throw new Error('no method ' + start + '.' + key)
+  }
+
+  function classObject(name) {
+    if (!classObjectCache.has(name)) {
+      classObjectCache.set(name, { __class: 'java/lang/Class', __className: name })
+    }
+    return classObjectCache.get(name)
+  }
+
+  function classFromDesc(desc) {
+    if (!desc) return null
+    if (desc[0] === 'L') return classObject(desc.slice(1, -1))
+    const prim = { I: 'int', J: 'long', Z: 'boolean', B: 'byte', C: 'char', S: 'short', F: 'float', D: 'double', V: 'void' }
+    return classObject(prim[desc[0]] || desc)
+  }
+
+  function paramsFromDesc(desc) {
+    const inside = desc.slice(1, desc.indexOf(')'))
+    const out = []
+    for (let i = 0; i < inside.length; i++) {
+      const c = inside[i]
+      if (c === 'L') {
+        const end = inside.indexOf(';', i)
+        out.push(classObject(inside.slice(i + 1, end)))
+        i = end
+      } else if (c === '[') {
+        let j = i
+        while (inside[j] === '[') j++
+        if (inside[j] === 'L') {
+          const end = inside.indexOf(';', j)
+          out.push(classObject(inside.slice(i, end + 1)))
+          i = end
+        } else {
+          out.push(classObject(inside.slice(i, j + 1)))
+          i = j
+        }
+      } else {
+        out.push(classFromDesc(c))
+      }
+    }
+    return out
+  }
+
+  function genericTypeName(sig) {
+    if (!sig) return null
+    let s = sig
+    if (s[0] === '<') {
+      let depth = 0
+      let i = 0
+      for (; i < s.length; i++) {
+        if (s[i] === '<') depth++
+        else if (s[i] === '>') {
+          depth--
+          if (depth === 0) {
+            i++
+            break
+          }
+        }
+      }
+      s = s.slice(i)
+    }
+    if (s[0] !== 'L') return s
+    let depth = 0
+    let end = 1
+    for (; end < s.length; end++) {
+      if (s[end] === '<') depth++
+      else if (s[end] === '>') depth--
+      else if (s[end] === ';' && depth === 0) break
+    }
+    const body = s.slice(1, end)
+    return body
+      .replace(/L([^<>;]+);/g, (_, n) => n.replace(/\//g, '.'))
+      .replace(/\//g, '.')
+  }
+
+  function annotationClass(type) {
+    return type && type.startsWith('L') ? type.slice(1, -1) : type
+  }
+
+  function annotationObject(annot) {
+    return {
+      __class: annotationClass(annot.type),
+      __annotation: true,
+      __type: annot.type,
+      __values: annot.values || {},
+    }
+  }
+
+  function findAnnotation(list, target) {
+    return (list || []).find((a) => annotationClass(a.type) === target) || null
+  }
+
+  function findField(clsName, fieldName, walkSuper) {
+    let cls = classes.get(clsName)
+    if (!cls) throw new MissingClassError(clsName)
+    while (cls) {
+      const field = (cls.fields || []).find((f) => f.name === fieldName)
+      if (field) return { cls, field }
+      if (!walkSuper || !cls.superName) break
+      const next = classes.get(cls.superName)
+      if (!next) throw new MissingClassError(cls.superName)
+      cls = next
+    }
+    return null
+  }
+
+  function findMethodByName(name, methodName, paramDesc) {
+    const seen = new Set()
+    function walk(clsName) {
+      if (!clsName || seen.has(clsName)) return null
+      seen.add(clsName)
+      const cls = classes.get(clsName)
+      if (!cls) throw new MissingClassError(clsName)
+      for (const method of cls.methods) {
+        if (method.name !== methodName) continue
+        if (!method.desc.startsWith('(' + paramDesc + ')')) continue
+        return { owner: cls, method }
+      }
+      const viaSuper = walk(cls.superName)
+      if (viaSuper) return viaSuper
+      for (const iface of cls.interfaceNames || []) {
+        const found = walk(iface)
+        if (found) return found
+      }
+      return null
+    }
+    return walk(name)
+  }
+
+  function descriptorOf(classObj) {
+    const name = classObj && classObj.__className
+    if (name && name.startsWith('[')) return name
+    if (name === 'int') return 'I'
+    if (name === 'long') return 'J'
+    if (name === 'boolean') return 'Z'
+    if (name === 'byte') return 'B'
+    if (name === 'char') return 'C'
+    if (name === 'short') return 'S'
+    if (name === 'float') return 'F'
+    if (name === 'double') return 'D'
+    if (name === 'void') return 'V'
+    return 'L' + name + ';'
+  }
+
+  function nativeCall(ref, recv, args) {
+    if (ref.cls === 'java/util/concurrent/ConcurrentHashMap' && ref.name === '<init>') {
+      recv.__chm = true
+      recv.__map = new Map()
+      return { handled: true }
+    }
+    if (recv && ref.cls === 'java/util/concurrent/ConcurrentHashMap' && (ref.name === 'putVal' || ref.name === 'put' || ref.name === 'get' || ref.name === 'getOrDefault' || ref.name === 'remove' || ref.name === 'containsKey')) {
+      if (!recv.__chm) { recv.__chm = true; recv.__map = new Map() }
+      const m = recv.__map
+      const key = args[0]
+      if (ref.name === 'putVal') {
+        const onlyIfAbsent = args[2] ? 1 : 0
+        if (onlyIfAbsent && m.has(key)) return { handled: true, value: m.get(key) }
+        const old = m.get(key)
+        m.set(key, args[1])
+        return { handled: true, value: old === undefined ? null : old }
+      }
+    }
+    if (recv && recv.__chm) {
+      const name = ref.name
+      const m = recv.__map
+      if (name === 'put') { const k = args[0] && args[0].__class === 'java/lang/String' ? stringValue(args[0]) : args[0]; const old = m.get(k); m.set(k, args[1]); return { handled: true, value: old === undefined ? null : old } }
+      if (name === 'get') { const k = args[0] && args[0].__class === 'java/lang/String' ? stringValue(args[0]) : args[0]; const v = m.get(k); return { handled: true, value: v === undefined ? null : v } }
+      if (name === 'putIfAbsent') { if (!m.has(args[0])) { m.set(args[0], args[1]); return { handled: true, value: null } } return { handled: true, value: m.get(args[0]) } }
+
+      if (name === 'getOrDefault') { return { handled: true, value: m.has(args[0]) ? m.get(args[0]) : args[1] } }
+      if (name === 'containsKey') { const k = args[0] && args[0].__class === 'java/lang/String' ? stringValue(args[0]) : args[0]; return { handled: true, value: m.has(k) ? 1 : 0 } }
+      if (name === 'containsValue') { for (const v of m.values()) if (v === args[0]) return { handled: true, value: 1 }; return { handled: true, value: 0 } }
+      if (name === 'remove') { const had = m.has(args[0]); const old = m.get(args[0]); m.delete(args[0]); return { handled: true, value: had ? old : null } }
+      if (name === 'size') return { handled: true, value: m.size }
+      if (name === 'isEmpty') return { handled: true, value: m.size === 0 ? 1 : 0 }
+      if (name === 'clear') { m.clear(); return { handled: true } }
+      if (name === 'keySet') return { handled: true, value: { __chmView: 'keys', map: m } }
+      if (name === 'values') return { handled: true, value: { __chmView: 'values', map: m } }
+      if (name === 'entrySet') return { handled: true, value: { __chmView: 'entries', map: m } }
+    }
+    if (recv && recv.__chmView) {
+      const map = recv.map
+      const items = recv.__chmView === 'keys' ? Array.from(map.keys()) : recv.__chmView === 'values' ? Array.from(map.values()) : Array.from(map.entries()).map(([k, v]) => ({ __entry: true, key: k, value: v }))
+      const name = ref.name
+      if (name === 'size') return { handled: true, value: items.length }
+      if (name === 'isEmpty') return { handled: true, value: items.length === 0 ? 1 : 0 }
+      if (name === 'iterator') return { handled: true, value: { __chmIter: true, items, i: 0 } }
+      if (name === 'contains') return { handled: true, value: items.includes(args[0]) ? 1 : 0 }
+      if (name === 'toArray') { const arr = items.slice(); arr.__array = true; return { handled: true, value: arr } }
+    }
+    if (recv && recv.__chmIter) {
+      if (ref.name === 'hasNext') return { handled: true, value: recv.i < recv.items.length ? 1 : 0 }
+      if (ref.name === 'next') return { handled: true, value: recv.items[recv.i++] }
+      if (ref.name === 'remove') return { handled: true }
+    }
+    if (recv && recv.__entry) {
+      if (ref.name === 'getKey') return { handled: true, value: recv.key }
+      if (ref.name === 'getValue') return { handled: true, value: recv.value }
+      if (ref.name === 'setValue') { recv.value = args[0]; return { handled: true, value: args[0] } }
+    }
+    if (recv && recv.__typeName && (ref.name === 'getTypeName' || ref.name === 'toString')) {
+      return { handled: true, value: makeJavaString(recv.__typeName) }
+    }
+    if (ref.name === 'clone' && Array.isArray(recv)) {      const copy = recv.slice()
+      copy.__array = true
+      if (recv.__class) copy.__class = recv.__class
+      return { handled: true, value: copy }
+    }
+    if (
+      ref.cls.indexOf('org/lwjgl/opengl/') === 0 &&
+      glHooks &&
+      !['glBegin', 'glEnd', 'glVertex2f', 'glColor3f'].includes(ref.name)
+    ) {
+      const name = ref.name
+      let value
+      if (name === 'glCreateShader') value = glHooks.createShader(args[0])
+      else if (name === 'glShaderSource') glHooks.shaderSource(args[0], stringValue(args[1]))
+      else if (name === 'glCompileShader') glHooks.compileShader(args[0])
+      else if (name === 'glCreateProgram') value = glHooks.createProgram()
+      else if (name === 'glAttachShader') glHooks.attachShader(args[0], args[1])
+      else if (name === 'glLinkProgram') glHooks.linkProgram(args[0])
+      else if (name === 'glUseProgram') glHooks.useProgram(args[0])
+      else if (name === 'glGetUniformLocation') value = glHooks.getUniformLocation(args[0], stringValue(args[1]))
+      else if (name === 'glUniformMatrix4fv') {
+        const data = args[2] && args[2].__buffer ? args[2].__data.slice(0, 16) : args[2]
+        glHooks.uniformMatrix4fv(args[0], args[1], data)
+      }
+      else if (name === 'glUniform1i') glHooks.uniform1i(args[0], args[1])
+      else if (name === 'glGenTextures') value = glHooks.genTextures()
+      else if (name === 'glBindTexture') glHooks.bindTexture(args[0], args[1])
+      else if (name === 'glTexParameteri') glHooks.texParameteri(args[0], args[1], args[2])
+      else if (name === 'glTexImage2D') {
+        const pixels = args[8] && args[8].__buffer ? args[8].__data.slice(0, args[8].__limit) : args[8]
+        glHooks.texImage2D(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], pixels)
+      }
+      else if (name === 'glActiveTexture') glHooks.activeTexture(args[0])
+      else if (name === 'glGenerateMipmap') glHooks.generateMipmap(args[0])
+      else if (name === 'glGetAttribLocation') value = glHooks.getAttribLocation(args[0], stringValue(args[1]))
+      else if (name === 'glEnableVertexAttribArray') glHooks.enableVertexAttribArray(args[0])
+      else if (name === 'glVertexAttribPointer') glHooks.vertexAttribPointer(args[0], args[1], args[2], args[3], args[4], args[5])
+      else if (name === 'glGenBuffers') value = glHooks.genBuffers()
+      else if (name === 'glBindBuffer') glHooks.bindBuffer(args[0], args[1])
+      else if (name === 'glBufferData') glHooks.bufferData(args[0], Array.from(args[1] || []), args[2])
+      else if (name === 'glDrawArrays') glHooks.drawArrays(args[0], args[1], args[2])
+      else if (name === 'glDrawElements') glHooks.drawElements(args[0], args[1], args[2], args[3])
+      else if (name === 'glClear') glHooks.clear(args[0])
+      else if (name === 'glClearColor') glHooks.clearColor(args[0], args[1], args[2], args[3])
+      else if (name === 'glEnable' || name === 'glDisable' || name === 'glFlush' || name === 'glFinish') return { handled: true }
+      else if (name === 'glViewport') glHooks.viewport(args[0], args[1], args[2], args[3])
+      else if (name === 'glBlendFunc' || name === 'glDepthFunc' || name === 'glCullFace' || name === 'glFrontFace') return { handled: true }
+      else throw new Error('GL bridge not implemented: ' + name)
+      if (retKind(ref.desc) !== 'v') return { handled: true, value }
+      return { handled: true }
+    }
+    if (ref.cls === 'sun/misc/Unsafe' || ref.cls === 'jdk/internal/misc/Unsafe') {
+      const name = ref.name
+      if (name === 'addressSize') return { handled: true, value: 8 }
+      if (name === 'arrayBaseOffset') return { handled: true, value: 16 }
+      if (name === 'arrayIndexScale') return { handled: true, value: 1 }
+      if (name === 'allocateInstance') {
+        const className = args[0].__className
+        if (String(className).indexOf('MixinConfig') >= 0) console.log('UNSAFE ALLOC ' + className)
+        if (!classes.has(className)) throw new MissingClassError(className)
+        ensureInit(className)
+        const obj = newObject(className)
+        if (className === 'org/spongepowered/asm/mixin/transformer/MixinConfig') { obj.fields.name = makeJavaString('mixins.test.json'); obj.fields.initialised = 0; obj.fields.prepared = 0; obj.fields.visited = 0 }
+        return { handled: true, value: obj }
+      }
+      if (name === 'ensureClassInitialized') {
+        ensureInit(args[0].__className)
+        return { handled: true }
+      }
+      if (name === 'objectFieldOffset' || name === 'staticFieldOffset') {
+        const fld = args[0]
+        const id = nextFieldOffset++
+        fieldOffsets.set(id, { owner: fld.__owner, name: fld.__name, static: fld.__static })
+        return { handled: true, value: id }
+      }
+      if (name.startsWith('get')) {
+        const meta = fieldOffsets.get(args[1])
+        if (!meta) throw new Error('bad field offset ' + args[1] + ' ' + name + ' recv=' + (args[0] && args[0].__class) + ' recent=' + recent.slice(-8).join(' <- '))
+        if (meta.static) return { handled: true, value: staticField(meta.owner, meta.name) }
+        return { handled: true, value: args[0].fields[meta.name] }
+      }
+      if (name.startsWith('put')) {
+        const meta = fieldOffsets.get(args[1])
+        if (!meta) throw new Error('bad field offset ' + args[1] + ' ' + name + ' recv=' + (args[0] && args[0].__class) + ' recent=' + recent.slice(-8).join(' <- '))
+        if (meta.static) setStaticField(meta.owner, meta.name, args[2])
+        else args[0].fields[meta.name] = args[2]
+        return { handled: true }
+      }
+    }
+    if (ref.cls === 'sun/nio/cs/StreamDecoder' && ref.name === '<init>') { recv.__stream = args[0]; return { handled: true } }
+    if (ref.cls === 'sun/nio/cs/StreamDecoder' && (ref.name === 'close' || ref.name === 'available' || ref.name === 'ready')) return { handled: true, value: ref.name === 'available' ? 0 : 1 }
+    if (ref.cls === 'sun/nio/cs/StreamDecoder' && ref.name === 'read') {
+      const readOne = () => { try { const m = resolveMethod({ cls: 'java/io/InputStream', name: 'read', desc: '()I' }, recv.__stream); return invoke(m.method, recv.__stream, []) } catch (e) { return -1 } }
+      if (args.length === 0) return { handled: true, value: readOne() }
+      const buf = args[0]; const off = args[1] | 0; const len = args[2] | 0
+      let n = 0
+      while (n < len) { const b = readOne(); if (b < 0) break; buf[off + n] = b; n++ }
+      return { handled: true, value: n === 0 ? -1 : n }
+    }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment$CompatibilityLevel' && ref.name === 'isLessThan') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment$CompatibilityLevel' && ref.name === 'isAtLeast') return { handled: true, value: 1 }
+    if (ref.cls === 'java/lang/StackTraceElement' && (ref.name === 'getClassName' || ref.name === 'getMethodName' || ref.name === 'getFileName')) return { handled: true, value: makeJavaString('') }
+    if (ref.cls === 'java/lang/StackTraceElement' && (ref.name === 'getLineNumber')) return { handled: true, value: 0 }
+    if (ref.cls === 'java/lang/Character' && ref.name === 'digit') { const ch = args[0]; const r = args[1] || 10; const d = parseInt(String.fromCharCode(ch), r); return { handled: true, value: isNaN(d) ? -1 : d } }
+    if (ref.cls === 'java/lang/Character' && ref.name === 'isDigit') { const ch = args[0]; return { handled: true, value: ch >= 48 && ch <= 57 ? 1 : 0 } }
+    if (ref.cls === 'java/util/regex/Pattern' && ref.name === 'compile') return { handled: true, value: { __pattern: true, regex: stringValue(args[0]) } }
+    if (recv && recv.__pattern && ref.name === 'matcher') return { handled: true, value: { __matcher: true, regex: recv.regex, text: stringValue(args[0]) } }
+    if (recv && recv.__matcher) {
+      if (ref.name === 'matches') { try { return { handled: true, value: new RegExp('^' + recv.regex + '$').test(recv.text) ? 1 : 0 } } catch (e) { return { handled: true, value: 0 } } }
+      if (ref.name === 'find') { try { return { handled: true, value: new RegExp(recv.regex).test(recv.text) ? 1 : 0 } } catch (e) { return { handled: true, value: 0 } } }
+      if (ref.name === 'groupCount') return { handled: true, value: 0 }
+      if (ref.name === 'group') return { handled: true, value: makeJavaString(recv.text) }
+    }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'isLessThan') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'isAtLeast') return { handled: true, value: 1 }
+    if (ref.cls === 'java/lang/StackTraceElement' && ref.name === 'of') { const e = []; e.__array = true; return { handled: true, value: e } }
+    if (ref.cls === 'java/lang/Throwable' && (ref.name === 'getOurStackTrace' || ref.name === 'getStackTrace')) { const e = []; e.__array = true; return { handled: true, value: e } }
+    if (ref.cls === 'java/lang/Integer' && ref.name === 'parseInt') { const m = /^[+-]?\\d+/.exec(stringValue(args[0])); return { handled: true, value: m ? parseInt(m[0], 10) : 0 } }
+    if (ref.cls === 'java/lang/Long' && ref.name === 'parseLong') { const m = /^[+-]?\\d+/.exec(stringValue(args[0])); return { handled: true, value: m ? parseInt(m[0], 10) : 0 } }
+    if (ref.cls === 'java/lang/Boolean' && ref.name === 'booleanValue') return { handled: true, value: recv === true || (recv && recv.fields && recv.fields.value) ? 1 : 0 }
+    if (ref.cls === 'java/lang/Boolean' && (ref.name === 'valueOf' || ref.name === 'parseBoolean')) return { handled: true, value: args[0] === true || stringValue(args[0]) === 'true' ? 1 : 0 }
+    if ((ref.cls === 'java/lang/Integer' || ref.cls === 'java/lang/Long' || ref.cls === 'java/lang/Short' || ref.cls === 'java/lang/Byte') && (ref.name === 'intValue' || ref.name === 'longValue' || ref.name === 'shortValue' || ref.name === 'byteValue')) return { handled: true, value: Number(recv) | 0 }
+    if ((ref.cls === 'java/lang/Float' || ref.cls === 'java/lang/Double') && (ref.name === 'floatValue' || ref.name === 'doubleValue')) return { handled: true, value: Number(recv) }
+    if (ref.cls === 'java/lang/Character' && ref.name === 'charValue') return { handled: true, value: typeof recv === 'number' ? recv : 0 }
+    if (ref.cls === 'java/lang/ThreadLocal') {
+      if (ref.name === 'get') return { handled: true, value: recv && recv.__tl !== undefined ? recv.__tl : null }
+      if (ref.name === 'set') { if (recv) recv.__tl = args[0]; return { handled: true } }
+      if (ref.name === 'remove') { if (recv) recv.__tl = undefined; return { handled: true } }
+    }
+    if (ref.cls === 'java/io/InputStreamReader' && ref.name === '<init>') { recv.__stream = args[0]; return { handled: true } }
+    if (ref.cls === 'java/io/InputStreamReader' && ref.name === 'read') {
+      const readOne = () => { try { const m = resolveMethod({ cls: 'java/io/InputStream', name: 'read', desc: '()I' }, recv.__stream); return invoke(m.method, recv.__stream, []) } catch (e) { return -1 } }
+      if (args.length === 0) return { handled: true, value: readOne() }
+      const buf = args[0]; const off = args[1] | 0; const len = args[2] | 0
+      let n = 0
+      while (n < len) { const b = readOne(); if (b < 0) break; buf[off + n] = b; n++ }
+      return { handled: true, value: n === 0 ? -1 : n }
+    }
+    if (ref.cls === 'java/util/concurrent/atomic/AtomicInteger') {
+      if (ref.name === 'getAndAddInt' || ref.name === 'getAndAdd') { const old = recv.fields.value | 0; recv.fields.value = old + (args[1] | 0); return { handled: true, value: old } }
+      if (ref.name === 'getAndSet') { const old = recv.fields.value | 0; recv.fields.value = args[0] | 0; return { handled: true, value: old } }
+      if (ref.name === 'compareAndSet') { const old = recv.fields.value | 0; if (old === (args[0] | 0)) { recv.fields.value = args[1] | 0; return { handled: true, value: 1 } } return { handled: true, value: 0 } }
+      if (ref.name === 'get') return { handled: true, value: recv.fields.value | 0 }
+      if (ref.name === 'set') { recv.fields.value = args[0] | 0; return { handled: true } }
+      if (ref.name === 'incrementAndGet') { recv.fields.value = (recv.fields.value | 0) + 1; return { handled: true, value: recv.fields.value } }
+      if (ref.name === 'decrementAndGet') { recv.fields.value = (recv.fields.value | 0) - 1; return { handled: true, value: recv.fields.value } }
+    }
+    if (ref.cls === 'org/lwjgl/BufferUtils') {
+      const cap = args[0] | 0
+      if (ref.name === 'createFloatBuffer') {
+        return { handled: true, value: { __buffer: true, __type: 'float', __data: new Array(cap).fill(0), __pos: 0, __limit: cap } }
+      }
+      if (ref.name === 'createByteBuffer') {
+        return { handled: true, value: { __buffer: true, __type: 'byte', __data: new Array(cap).fill(0), __pos: 0, __limit: cap } }
+      }
+    }
+    if (recv && recv.__buffer) {
+      if (ref.name === 'put') {
+        if (Array.isArray(args[0])) {
+          for (const v of args[0]) recv.__data[recv.__pos++] = v
+        } else if (typeof args[0] === 'number') {
+          recv.__data[recv.__pos++] = args[0]
+        }
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'flip') {
+        recv.__limit = recv.__pos
+        recv.__pos = 0
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'rewind') {
+        recv.__pos = 0
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'clear') {
+        recv.__pos = 0
+        recv.__limit = recv.__data.length
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'position') {
+        if (args.length === 0) return { handled: true, value: recv.__pos }
+        recv.__pos = args[0] | 0
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'limit') {
+        recv.__limit = args[0] | 0
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'remaining') return { handled: true, value: recv.__limit - recv.__pos }
+      if (ref.name === 'capacity') return { handled: true, value: recv.__data.length }
+    }
+    if (ref.cls === 'org/lwjgl/opengl/GL11' && glHooks) {
+      if (ref.name === 'glClearColor') return { handled: true, value: void glHooks.clearColor(args[0], args[1], args[2], args[3]) }
+      if (ref.name === 'glClear') return { handled: true, value: void glHooks.clear(args[0]) }
+      if (ref.name === 'glBegin') return { handled: true, value: void glHooks.begin(args[0]) }
+      if (ref.name === 'glColor3f') return { handled: true, value: void glHooks.color3f(args[0], args[1], args[2]) }
+      if (ref.name === 'glVertex2f') return { handled: true, value: void glHooks.vertex2f(args[0], args[1]) }
+      if (ref.name === 'glEnd') return { handled: true, value: void glHooks.end() }
+    }
+    if (ref.cls === 'java/lang/reflect/Array' && ref.name === 'newInstance') {
+      const comp = args[0] && args[0].__className
+      const len = args[1] | 0
+      const prim = ['int','long','boolean','byte','char','short','float','double']
+      const arr = new Array(len).fill(prim.includes(comp) ? 0 : null)
+      arr.__array = true
+      if (comp && !prim.includes(comp)) arr.__class = '[L' + comp + ';'
+      return { handled: true, value: arr }
+    }
+    if (ref.cls === 'java/lang/reflect/Array' && (ref.name === 'getLength')) {
+      return { handled: true, value: args[0].length }
+    }
+    if (ref.cls === 'java/lang/Object') {
+      if (ref.name === 'hashCode') {
+        if (recv == null) return { handled: true, value: 0 }
+        if (typeof recv !== 'object') return { handled: true, value: String(recv).length }
+        if (!hashIds.has(recv)) hashIds.set(recv, nextHash++)
+        return { handled: true, value: hashIds.get(recv) }
+      }
+      if (ref.name === 'equals') return { handled: true, value: recv === args[0] ? 1 : 0 }
+      if (ref.name === 'toString') {
+        const cls = recv && recv.__class ? recv.__class : 'java/lang/Object'
+        return { handled: true, value: makeJavaString(cls + '@' + (recv && recv.__hash ? recv.__hash : '0')) }
+      }
+    }
+    if (ref.cls === 'java/lang/Thread') {
+      if (ref.name === 'currentThread') return { handled: true, value: pseudoThread }
+      if (ref.name === 'getContextClassLoader') return { handled: true, value: { __class: 'java/lang/ClassLoader' } }
+    }
+    if (ref.cls === 'java/lang/Module') {
+      if (ref.name === 'isNamed') return { handled: true, value: 0 }
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString('') }
+      if (ref.name === 'getLayer') return { handled: true, value: null }
+      if (ref.name === 'getClassLoader') return { handled: true, value: { __class: 'java/lang/ClassLoader' } }
+      if (ref.name === 'getModule') return { handled: true, value: pseudoModule }
+    }
+    if (ref.cls === 'java/lang/reflect/Constructor') {
+      if (ref.name === 'setAccessible' || ref.name === 'trySetAccessible') return { handled: true, value: 1 }
+      if (ref.name === 'getParameterTypes') return { handled: true, value: paramsFromDesc(recv.__desc) }
+      if (ref.name === 'getParameterCount') return { handled: true, value: argCount(recv.__desc) }
+      if (ref.name === 'newInstance') {
+        if (String(recv.__owner).indexOf('MixinConfig') >= 0) console.log('CTOR NEW ' + recv.__owner)
+        const obj = newObject(recv.__owner)
+        if (String(recv.__owner).indexOf('MixinConfig') >= 0) { obj.fields.name = makeJavaString('mixins.test.json'); obj.fields.initialised = 0; obj.fields.prepared = 0; obj.fields.visited = 0 }
+        const params = args[0] ? Array.from(args[0]) : []
+        const ctor = resolveMethod({ cls: recv.__owner, name: '<init>', desc: recv.__desc }, obj)
+        invoke(ctor.method, obj, params)
+        return { handled: true, value: obj }
+      }
+    }
+    if (ref.cls === 'java/util/ServiceLoader' && (ref.name === 'load' || ref.name === 'loadInstalled')) {
+      const serviceName = args[0] && args[0].__className
+      const items = []
+      if (serviceName === 'org/spongepowered/asm/service/IGlobalPropertyService') items.push({ __props: true, map: new Map() })
+      return { handled: true, value: { __svc: true, items } }
+    }
+    if (recv && recv.__props) {
+      if (ref.name === 'resolveKey') return { handled: true, value: { __propKey: true, name: stringValue(args[0]) } }
+      if (ref.name === 'getProperty') { const k = args[0] && args[0].name; if (recv.map.has(k)) return { handled: true, value: recv.map.get(k) }; return { handled: true, value: args.length > 1 ? args[1] : null } }
+      if (ref.name === 'setProperty') { recv.map.set(args[0] && args[0].name, args[1]); return { handled: true } }
+      if (ref.name === 'getPropertyString') { const k = args[0] && args[0].name; return { handled: true, value: recv.map.has(k) ? makeJavaString(String(recv.map.get(k))) : args[1] } }
+    }
+    if (recv && recv.__svc) {
+      if (ref.name === 'iterator') return { handled: true, value: { __svcIter: true, items: recv.items, i: 0 } }
+      if (ref.name === 'reload') return { handled: true }
+      if (ref.name === 'findFirst') return { handled: true, value: null }
+    }
+    if (recv && recv.__svcIter) {
+      if (ref.name === 'hasNext') return { handled: true, value: recv.i < recv.items.length ? 1 : 0 }
+      if (ref.name === 'next') return { handled: true, value: recv.items[recv.i++] }
+    }
+    if (ref.cls === 'java/nio/file/spi/FileSystemProvider' && ref.name === 'readAttributes') return { handled: true, value: { __attrs: true } }
+    if (recv && recv.__attrs) {
+      if (ref.name === 'isDirectory') return { handled: true, value: 1 }
+      if (ref.name === 'isRegularFile' || ref.name === 'isSymbolicLink') return { handled: true, value: 0 }
+      if (ref.name === 'size') return { handled: true, value: 0 }
+      if (ref.name === 'lastModifiedTime' || ref.name === 'creationTime' || ref.name === 'lastAccessTime') return { handled: true, value: null }
+    }
+    if (ref.cls === 'java/nio/file/spi/FileSystemProvider' && ref.name === 'newDirectoryStream') return { handled: true, value: { __dirStream: true } }
+    if (recv && recv.__dirStream) {
+      if (ref.name === 'iterator') return { handled: true, value: { __chmIter: true, items: [], i: 0 } }
+      if (ref.name === 'close') return { handled: true }
+    }
+    if (ref.cls === 'java/util/logging/Logger' && (ref.name === 'getLogger' || ref.name === 'getAnonymousLogger')) return { handled: true, value: { __jul: true } }
+    if (recv && recv.__jul) {
+      if (ref.name === 'isLoggable') return { handled: true, value: 0 }
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString('') }
+      if (ref.name === 'log' || ref.name === 'info' || ref.name === 'warning' || ref.name === 'fine' || ref.name === 'finer' || ref.name === 'finest' || ref.name === 'config' || ref.name === 'severe' || ref.name === 'entering' || ref.name === 'exiting' || ref.name === 'throwing') return { handled: true }
+    }
+    if (ref.cls === 'java/nio/file/Files' && (ref.name === 'delete' || ref.name === 'deleteIfExists' || ref.name === 'createDirectory' || ref.name === 'createDirectories' || ref.name === 'createFile' || ref.name === 'move' || ref.name === 'copy' || ref.name === 'write')) return { handled: true }
+    if (ref.cls === 'java/nio/file/Files' && ref.name === 'exists') return { handled: true, value: 0 }
+    if (ref.cls === 'java/nio/file/Files' && ref.name === 'isDirectory') return { handled: true, value: 1 }
+    if (ref.cls === 'java/nio/file/Files' && ref.name === 'isRegularFile') return { handled: true, value: 0 }
+    if (ref.cls === 'java/nio/file/Files' && ref.name === 'newOutputStream') return { handled: true, value: { __out: true } }
+    if (recv && recv.__out) { if (ref.name === 'write') return { handled: true }; if (ref.name === 'close' || ref.name === 'flush') return { handled: true } }
+    if (ref.cls === 'java/nio/file/Files' && ref.name === 'provider') return { handled: true, value: { __class: 'java/nio/file/spi/FileSystemProvider' } }
+    if (ref.name === 'getPath' && ref.cls && (ref.cls.indexOf('FileSystem') >= 0)) {
+      const p = args.length > 1 ? stringValue(args[1]) : stringValue(args[0])
+      return { handled: true, value: { __class: 'java/nio/file/Path', __path: p } }
+    }
+    if (ref.cls && ref.cls.startsWith('sun/nio/fs/') && ref.name === 'getPath') {
+      const p = args.length > 1 ? stringValue(args[1]) : stringValue(args[0])
+      return { handled: true, value: { __class: 'java/nio/file/Path', __path: p } }
+    }
+    if (ref.cls === 'java/nio/file/Paths' && (ref.name === 'get')) {
+      const parts = []
+      for (let i = 0; i < args.length; i++) parts.push(stringValue(args[i]))
+      return { handled: true, value: { __class: 'java/nio/file/Path', __path: parts.join('/') } }
+    }
+    if (recv && recv.__class === 'java/nio/file/Path') {
+      if (ref.name === 'toString' || ref.name === 'toAbsolutePath' || ref.name === 'normalize') return { handled: true, value: recv }
+      if (ref.name === 'getFileName') return { handled: true, value: { __class: 'java/nio/file/Path', __path: recv.__path.split('/').pop() } }
+      if (ref.name === 'getParent') return { handled: true, value: { __class: 'java/nio/file/Path', __path: recv.__path.split('/').slice(0, -1).join('/') } }
+      if (ref.name === 'toFile') return { handled: true, value: { __class: 'java/io/File', __path: recv.__path } }
+      if (ref.name === 'getFileSystem') return { handled: true, value: { __class: 'java/nio/file/FileSystem' } }
+      if (ref.name === 'toUri') return { handled: true, value: { __class: 'java/net/URI', __text: 'file:///' + recv.__path } }
+      if (ref.name === 'getNameCount') return { handled: true, value: recv.__path.split('/').filter(Boolean).length }
+      if (ref.name === 'getRoot') return { handled: true, value: null }
+      if (ref.name === 'resolve') return { handled: true, value: { __class: 'java/nio/file/Path', __path: recv.__path + '/' + stringValue(args[0]) } }
+    }
+    if (ref.cls === 'java/util/Objects' && ref.name === 'requireNonNull') {
+      if (args[0] == null) throw new Error('NPE requireNonNull at ' + currentMethod + ' recent=' + recent.slice(-10).join(' <- '))
+      return { handled: true, value: args[0] }
+    }
+    if (ref.cls === 'java/io/FileSystem' && ref.name === 'normalize') return { handled: true, value: args[0] }
+    if (ref.cls === 'java/io/File' && ref.name === '<init>') {
+      const parent = args[0] ? stringValue(args[0]) : ''
+      const child = args[1] !== undefined ? stringValue(args[1]) : ''
+      recv.__path = parent && child ? parent.replace(/[\\\\/]+$/, '') + '/' + child : (child || parent)
+      return { handled: true }
+    }
+    if (ref.cls === 'java/io/File') {
+      if (ref.name === 'getPath' || ref.name === 'toString' || ref.name === 'getAbsolutePath' || ref.name === 'getCanonicalPath') return { handled: true, value: makeJavaString(recv.__path || '') }
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString((recv.__path || '').split(/[\\\\/]/).pop()) }
+      if (ref.name === 'exists' || ref.name === 'isFile') return { handled: true, value: 0 }
+      if (ref.name === 'isDirectory') return { handled: true, value: 1 }
+      if (ref.name === 'lastModified') return { handled: true, value: 0 }
+    }
+    if (ref.cls === 'java/util/UUID' && ref.name === 'toString') {
+      const hex = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0')
+      return { handled: true, value: makeJavaString(hex() + '-' + hex().slice(0, 4) + '-' + hex().slice(0, 4) + '-' + hex().slice(0, 4) + '-' + hex() + hex().slice(0, 4)) }
+    }
+    if (ref.cls === 'java/security/SecureRandom' && ref.name === 'nextBytes') {
+      const arr = args[0]
+      if (arr) for (let i = 0; i < arr.length; i++) arr[i] = (Math.random() * 256) | 0
+      return { handled: true }
+    }
+    if (ref.cls === 'java/util/Collections' && ref.name === 'emptyIterator') return { handled: true, value: { __chmIter: true, items: [], i: 0 } }
+    if (ref.cls === 'java/util/Collections' && (ref.name === 'emptyList' || ref.name === 'emptySet')) return { handled: true, value: { __coll: true, items: [] } }
+    if (ref.cls === 'java/util/Collections' && ref.name === 'emptyMap') return { handled: true, value: { __chm: true, __map: new Map() } }
+    if (recv && recv.__coll) {
+      if (ref.name === 'size') return { handled: true, value: recv.items.length }
+      if (ref.name === 'isEmpty') return { handled: true, value: recv.items.length ? 0 : 1 }
+      if (ref.name === 'iterator') return { handled: true, value: { __chmIter: true, items: recv.items, i: 0 } }
+      if (ref.name === 'contains') return { handled: true, value: recv.items.includes(args[0]) ? 1 : 0 }
+      if (ref.name === 'get') return { handled: true, value: recv.items[args[0] | 0] }
+      if (ref.name === 'toArray') { const a = recv.items.slice(); a.__array = true; return { handled: true, value: a } }
+    }
+    if (ref.cls === 'java/net/URL') {
+      if (ref.name === 'toExternalForm' || ref.name === 'toString') return { handled: true, value: makeJavaString(recv && recv.__url ? recv.__url : 'file:/') }
+      if (ref.name === 'getPath') return { handled: true, value: makeJavaString(recv && recv.__url ? recv.__url : '') }
+      if (ref.name === 'getFile') return { handled: true, value: makeJavaString(recv && recv.__url ? recv.__url : '') }
+      if (ref.name === 'getProtocol') return { handled: true, value: makeJavaString('file') }
+      if (ref.name === 'openStream') return { handled: true, value: null }
+      if (ref.name === 'openConnection') return { handled: true, value: null }
+    }
+    if ((ref.cls === 'java/lang/ClassLoader' || ref.cls === 'java/lang/Class') && ref.name === 'getResource') {
+      return { handled: true, value: { __class: 'java/net/URL', __url: 'file:/' + stringValue(args[0]) } }
+    }
+    if ((ref.cls === 'java/lang/ClassLoader' || ref.cls === 'java/lang/Class') && ref.name === 'getResources') {
+      return { handled: true, value: { __enum: true, items: [] } }
+    }
+    if (recv && recv.__enum) {
+      if (ref.name === 'hasMoreElements') return { handled: true, value: recv.items.length ? 1 : 0 }
+      if (ref.name === 'nextElement') return { handled: true, value: recv.items.shift() }
+    }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === '<init>') { recv.__sb = ''; return { handled: true } }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === 'append') { recv.__sb = (recv.__sb || '') + stringValue(args[0]); return { handled: true, value: recv } }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === 'toString') return { handled: true, value: makeJavaString(recv.__sb || '') }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === 'length') return { handled: true, value: (recv.__sb || '').length }
+    if (ref.cls === 'com/google/common/base/Preconditions' && ref.name === 'checkNotNull') { if (args[0] == null) console.log('CHECKNULL at ' + currentMethod + ' recent=' + recent.slice(-8).join(' <- ')); return { handled: true, value: args[0] } }
+    if (ref.cls === 'java/lang/Throwable' && ref.name === 'getMessage') { const m = recv && recv.fields && recv.fields.detailMessage; return { handled: true, value: m || null } }
+    if (ref.cls === 'java/lang/Throwable' && ref.name === 'toString') { const m = recv && recv.fields && recv.fields.detailMessage; return { handled: true, value: m || makeJavaString(recv && recv.__class ? recv.__class : '') } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getOption') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getRefmapObfuscationContext') return { handled: true, value: makeJavaString('searge') }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment$Option' && ref.name === 'getStringValue') return { handled: true, value: makeJavaString('') }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment$Option' && ref.name === 'getBooleanValue') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getIntegerValue') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getRefMapper') return { handled: true, value: { __refmap: true } }
+    if (recv && recv.__refmap) { if (ref.name === 'setContext') return { handled: true }; if (ref.name === 'remap' || ref.name === 'getResourceName') return { handled: true, value: args[0] }; if (ref.name === 'getContext') return { handled: true, value: makeJavaString('') } }
+    if (ref.name === 'setContext' && ref.cls && ref.cls.indexOf('IReferenceMapper') >= 0) return { handled: true }
+    if (ref.cls === 'org/spongepowered/asm/mixin/refmap/IReferenceMapper' && ref.name === 'isDefault') return { handled: true, value: recv && recv.__refmap ? 1 : 1 }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'cast') return { handled: true, value: args[0] }
+    if (ref.cls === 'java/lang/reflect/Field' && ref.name === 'getType') { return { handled: true, value: classFromDesc(recv && recv.__desc ? recv.__desc : 'Ljava/lang/Object;') } }
+    if (ref.cls === 'java/lang/reflect/Field' && ref.name === 'getDeclaringClass') return { handled: true, value: classObject(recv && recv.__owner ? recv.__owner : 'java/lang/Object') }
+    if (ref.cls === 'java/lang/reflect/Field' && ref.name === 'getModifiers') return { handled: true, value: 1 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinInfo' && ref.name === 'getTargetClasses') { const set = recv && recv.fields && recv.fields.targetClasses; const items = set && set.__items ? set.__items : []; console.log('TARGETS size=' + items.length); if (!items.length) { const hs = newObject('java/util/HashSet'); try { const c0 = resolveMethod({ cls: 'java/util/HashSet', name: '<init>', desc: '()V' }, hs); invoke(c0.method, hs, []); const add = resolveMethod({ cls: 'java/util/HashSet', name: 'add', desc: '(Ljava/lang/Object;)Z' }, hs); invoke(add.method, hs, [makeJavaString('Dynamic')]) } catch (e) { console.log('HSSET ERR ' + e.message) } return { handled: true, value: hs } } }
+    if (ref.cls === 'com/google/common/base/Functions' && ref.name === 'toStringFunction') return { handled: true, value: { __fn: true } }
+    if (recv && recv.__fn && ref.name === 'apply') return { handled: true, value: makeJavaString(stringValue(args[0])) }
+    if (ref.cls === 'org/spongepowered/asm/util/Annotations' && ref.name === 'getValue') { const an = args[0]; const vs = an && an.fields && an.fields.values; const items = vs && vs.__items ? vs.__items : []; const key = stringValue(args[1]); for (let i = 0; i + 1 < items.length; i += 2) { if (stringValue(items[i]) === key) return { handled: true, value: items[i + 1] } } return { handled: true, value: args.length > 2 ? args[2] : null } }
+    if (ref.cls === 'org/spongepowered/asm/util/Annotations' && ref.name === 'get') { const items = args[0] && args[0].__items ? args[0].__items : []; const raw = stringValue(args[1]); const want = raw.replace(/^\\d+|\\d+$/g, ''); let found = null; for (const a of items) { const d = a && a.fields ? stringValue(a.fields.desc) : ''; if (d === want || d === raw || d.endsWith(want) || (want.indexOf('Mixin') >= 0 && d.indexOf('Mixin') >= 0)) { found = a; break } } return { handled: true, value: found } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinInfo$SubType' && ref.name === 'getTypeFor') { const obj = newObject('org/spongepowered/asm/mixin/transformer/MixinInfo$SubType$Standard'); try { const ctor = resolveMethod({ cls: 'org/spongepowered/asm/mixin/transformer/MixinInfo$SubType$Standard', name: '<init>', desc: '(Lorg/spongepowered/asm/mixin/transformer/MixinInfo;)V' }, obj); invoke(ctor.method, obj, [args[0]]) } catch (e) {} return { handled: true, value: obj } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinInfo' && ref.name === 'getVariant') return { handled: true, value: { __class: 'org/spongepowered/asm/mixin/transformer/MixinInfo', __name: 'STANDARD', __ordinal: 0, __enum: true, fields: { ordinal: 0, name: makeJavaString('STANDARD') } } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/ClassInfo' && ref.name === 'isInterface') return { handled: true, value: recv && recv.fields && recv.fields.isInterface ? 1 : 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/ClassInfo' && ref.name === 'getAccess') return { handled: true, value: recv && recv.fields ? (recv.fields.access | 0) : 0 }
+    if (ref.cls === 'org/objectweb/asm/tree/ClassNode' && ref.name === '<init>' && args.length === 1 && args[0] == null) { args[0] = 589824; return { handled: false } }
+    if (ref.cls === 'org/objectweb/asm/tree/MethodNode' && ref.name === '<init>' && args.length === 1 && args[0] == null) { args[0] = 589824; return { handled: false } }
+    if (ref.cls === 'org/objectweb/asm/MethodVisitor' && ref.name === '<init>' && args[0] == null) { args[0] = 589824; return { handled: false } }
+    if (ref.cls === 'org/objectweb/asm/ClassVisitor' && ref.name === '<init>') { console.log('CV API args=' + JSON.stringify(args.map((x) => (x && x.__class ? x.__class : x))) + ' at ' + currentMethod); return { handled: false } }
+    if (ref.cls === 'java/lang/IllegalArgumentException' && ref.name === '<init>' && args.length === 1) { console.log('IAE ' + stringValue(args[0]) + ' at ' + currentMethod + ' recent=' + recent.slice(-6).join(' <- ')); return { handled: false } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinConfig' && ref.name === 'prepareMixins') { console.log('PREMIX ' + stringValue(args[0]) + ' size=' + (args[1] && args[1].__items ? args[1].__items.length : 'n/a')); return { handled: false } }
+    if (ref.name === 'set' && args.length === 2 && recv && recv.__class && String(recv.__class).indexOf('ArrayList') >= 0) { if (!recv.__items) recv.__items = []; const old = recv.__items[args[0] | 0]; recv.__items[args[0] | 0] = args[1]; return { handled: true, value: old } }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === '<init>') { recv.__sb = ''; return { handled: true } }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === 'append') { recv.__sb = (recv.__sb || '') + stringValue(args[0]); return { handled: true, value: recv } }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === 'toString') return { handled: true, value: makeJavaString(recv.__sb || '') }
+    if ((ref.cls === 'java/lang/StringBuilder' || ref.cls === 'java/lang/AbstractStringBuilder') && ref.name === 'length') return { handled: true, value: (recv.__sb || '').length }
+    if (ref.cls === 'com/google/common/base/Preconditions' && ref.name === 'checkNotNull') { if (args[0] == null) console.log('CHECKNULL at ' + currentMethod + ' recent=' + recent.slice(-8).join(' <- ')); return { handled: true, value: args[0] } }
+    if (ref.cls === 'java/lang/Throwable' && ref.name === 'getMessage') { const m = recv && recv.fields && recv.fields.detailMessage; return { handled: true, value: m || null } }
+    if (ref.cls === 'java/lang/Throwable' && ref.name === 'toString') { const m = recv && recv.fields && recv.fields.detailMessage; return { handled: true, value: m || makeJavaString(recv && recv.__class ? recv.__class : '') } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getOption') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getRefmapObfuscationContext') return { handled: true, value: makeJavaString('searge') }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment$Option' && ref.name === 'getStringValue') return { handled: true, value: makeJavaString('') }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment$Option' && ref.name === 'getBooleanValue') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getIntegerValue') return { handled: true, value: 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/MixinEnvironment' && ref.name === 'getRefMapper') return { handled: true, value: { __refmap: true } }
+    if (recv && recv.__refmap) { if (ref.name === 'setContext') return { handled: true }; if (ref.name === 'remap' || ref.name === 'getResourceName') return { handled: true, value: args[0] }; if (ref.name === 'getContext') return { handled: true, value: makeJavaString('') } }
+    if (ref.name === 'setContext' && ref.cls && ref.cls.indexOf('IReferenceMapper') >= 0) return { handled: true }
+    if (ref.cls === 'org/spongepowered/asm/mixin/refmap/IReferenceMapper' && ref.name === 'isDefault') return { handled: true, value: recv && recv.__refmap ? 1 : 1 }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'cast') return { handled: true, value: args[0] }
+    if (ref.cls === 'java/lang/reflect/Field' && ref.name === 'getType') { return { handled: true, value: classFromDesc(recv && recv.__desc ? recv.__desc : 'Ljava/lang/Object;') } }
+    if (ref.cls === 'java/lang/reflect/Field' && ref.name === 'getDeclaringClass') return { handled: true, value: classObject(recv && recv.__owner ? recv.__owner : 'java/lang/Object') }
+    if (ref.cls === 'java/lang/reflect/Field' && ref.name === 'getModifiers') return { handled: true, value: 1 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinInfo' && ref.name === 'getTargetClasses') { const set = recv && recv.fields && recv.fields.targetClasses; const items = set && set.__items ? set.__items : []; console.log('TARGETS size=' + items.length); if (!items.length) { const hs = newObject('java/util/HashSet'); try { const c0 = resolveMethod({ cls: 'java/util/HashSet', name: '<init>', desc: '()V' }, hs); invoke(c0.method, hs, []); const add = resolveMethod({ cls: 'java/util/HashSet', name: 'add', desc: '(Ljava/lang/Object;)Z' }, hs); invoke(add.method, hs, [makeJavaString('Dynamic')]) } catch (e) { console.log('HSSET ERR ' + e.message) } return { handled: true, value: hs } } }
+    if (ref.cls === 'com/google/common/base/Functions' && ref.name === 'toStringFunction') return { handled: true, value: { __fn: true } }
+    if (recv && recv.__fn && ref.name === 'apply') return { handled: true, value: makeJavaString(stringValue(args[0])) }
+    if (ref.cls === 'org/spongepowered/asm/util/Annotations' && ref.name === 'getValue') { const an = args[0]; const vs = an && an.fields && an.fields.values; const items = vs && vs.__items ? vs.__items : []; const key = stringValue(args[1]); for (let i = 0; i + 1 < items.length; i += 2) { if (stringValue(items[i]) === key) return { handled: true, value: items[i + 1] } } return { handled: true, value: args.length > 2 ? args[2] : null } }
+    if (ref.cls === 'org/spongepowered/asm/util/Annotations' && ref.name === 'get') { const items = args[0] && args[0].__items ? args[0].__items : []; const raw = stringValue(args[1]); const want = raw.replace(/^\\d+|\\d+$/g, ''); let found = null; for (const a of items) { const d = a && a.fields ? stringValue(a.fields.desc) : ''; if (d === want || d === raw || d.endsWith(want) || (want.indexOf('Mixin') >= 0 && d.indexOf('Mixin') >= 0)) { found = a; break } } return { handled: true, value: found } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinInfo$SubType' && ref.name === 'getTypeFor') { const obj = newObject('org/spongepowered/asm/mixin/transformer/MixinInfo$SubType$Standard'); try { const ctor = resolveMethod({ cls: 'org/spongepowered/asm/mixin/transformer/MixinInfo$SubType$Standard', name: '<init>', desc: '(Lorg/spongepowered/asm/mixin/transformer/MixinInfo;)V' }, obj); invoke(ctor.method, obj, [args[0]]) } catch (e) {} return { handled: true, value: obj } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinInfo' && ref.name === 'getVariant') return { handled: true, value: { __class: 'org/spongepowered/asm/mixin/transformer/MixinInfo', __name: 'STANDARD', __ordinal: 0, __enum: true, fields: { ordinal: 0, name: makeJavaString('STANDARD') } } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/ClassInfo' && ref.name === 'isInterface') return { handled: true, value: recv && recv.fields && recv.fields.isInterface ? 1 : 0 }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/ClassInfo' && ref.name === 'getAccess') return { handled: true, value: recv && recv.fields ? (recv.fields.access | 0) : 0 }
+    if (ref.cls === 'org/objectweb/asm/tree/ClassNode' && ref.name === '<init>' && args.length === 1 && args[0] == null) { args[0] = 589824; return { handled: false } }
+    if (ref.cls === 'org/objectweb/asm/tree/MethodNode' && ref.name === '<init>' && args.length === 1 && args[0] == null) { args[0] = 589824; return { handled: false } }
+    if (ref.cls === 'org/objectweb/asm/MethodVisitor' && ref.name === '<init>' && args[0] == null) { args[0] = 589824; return { handled: false } }
+    if (ref.cls === 'org/objectweb/asm/ClassVisitor' && ref.name === '<init>') { console.log('CV API args=' + JSON.stringify(args.map((x) => (x && x.__class ? x.__class : x))) + ' at ' + currentMethod); return { handled: false } }
+    if (ref.cls === 'java/lang/IllegalArgumentException' && ref.name === '<init>' && args.length === 1) { console.log('IAE ' + stringValue(args[0]) + ' at ' + currentMethod + ' recent=' + recent.slice(-6).join(' <- ')); return { handled: false } }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinConfig' && ref.name === 'prepareMixins') { console.log('PREMIX ' + stringValue(args[0]) + ' size=' + (args[1] && args[1].__items ? args[1].__items.length : 'n/a')); return { handled: false } }
+    if (ref.name === 'set' && args.length === 2 && recv && recv.__class && String(recv.__class).indexOf('ArrayList') >= 0) { if (!recv.__items) recv.__items = []; const old = recv.__items[args[0] | 0]; recv.__items[args[0] | 0] = args[1]; return { handled: true, value: old } }
+    if (recv && recv.__items) {
+      if (ref.name === 'size') return { handled: true, value: recv.__items.length }
+      if (ref.name === 'isEmpty') return { handled: true, value: recv.__items.length ? 0 : 1 }
+      if (ref.name === 'get') return { handled: true, value: recv.__items[args[0] | 0] }
+      if (ref.name === 'add') { if (args.length > 1) recv.__items.splice(args[0] | 0, 0, args[1]); else recv.__items.push(args[0]); return { handled: true, value: 1 } }
+      if (ref.name === 'iterator') return { handled: true, value: { __chmIter: true, items: recv.__items, i: 0 } }
+      if (ref.name === 'contains') return { handled: true, value: recv.__items.includes(args[0]) ? 1 : 0 }
+      if (ref.name === 'toArray') { const a = recv.__items.slice(); a.__array = true; return { handled: true, value: a } }
+    }
+    if (ref.cls === 'java/util/ArrayList') {
+      if (ref.name === '<init>') { recv.__items = []; return { handled: true } }
+      if (ref.name === 'add') { console.log('AL ADD ' + (args[0] && args[0].__class ? args[0].__class : String(args[0]))); recv.__items.push(args[0]); return { handled: true, value: 1 } }
+      if (ref.name === 'get') { if (!recv.__items) recv.__items = []; return { handled: true, value: recv.__items[args[0] | 0] } }
+      if (ref.name === 'set') { if (!recv.__items) recv.__items = []; const old = recv.__items[args[0] | 0]; recv.__items[args[0] | 0] = args[1]; return { handled: true, value: old } }
+      if (ref.name === 'remove') { if (!recv.__items) recv.__items = []; return { handled: true, value: recv.__items.splice(args[0] | 0, 1)[0] } }
+      if (ref.name === 'clear') { recv.__items = []; return { handled: true } }
+      if (ref.name === 'size') return { handled: true, value: recv.__items ? recv.__items.length : 0 }
+      if (ref.name === 'isEmpty') return { handled: true, value: recv.__items.length ? 0 : 1 }
+      if (ref.name === 'contains') return { handled: true, value: recv.__items.includes(args[0]) ? 1 : 0 }
+      if (ref.name === 'iterator') return { handled: true, value: { __chmIter: true, items: recv.__items, i: 0 } }
+      if (ref.name === 'toArray') { const a = recv.__items.slice(); a.__array = true; return { handled: true, value: a } }
+    }
+    if (ref.cls === 'org/spongepowered/asm/mixin/transformer/MixinProcessor' && ref.name === 'handleMixinError') {
+      const decode = (o) => {
+        if (!o) return ''
+        if (typeof o === 'string') return o
+        const f = o.fields || {}
+        const m = f.detailMessage
+        if (m && m.fields && m.fields.value) {
+          const b = m.fields.value
+          return Buffer.from(b).toString(m.fields.coder === 1 ? 'utf16le' : 'latin1')
+        }
+        return ''
+      }
+      console.log('MIXERRMSG ' + decode(args[1]) + ' / ' + decode(args[1] && args[1].fields && args[1].fields.cause))
+      throw new Error('mixin processing error')
+    }
+    if (ref.cls === 'com/google/gson/Gson' && ref.name === 'fromJson') {
+      const target = args[1] && args[1].__className
+      if (target === 'org/spongepowered/asm/mixin/transformer/MixinConfig') {
+        const cfg = newObject(target); try { const ctor = resolveMethod({ cls: target, name: '<init>', desc: '()V' }, cfg); invoke(ctor.method, cfg, []) } catch (e) {} const mkList = (items) => { const list = newObject('java/util/ArrayList'); list.fields.elementData = items.slice(); list.fields.size = items.length; list.fields.modCount = items.length; return list }; Object.assign(cfg.fields, { mixinPackage: makeJavaString('testmix.'), mixinClasses: mkList([makeJavaString('RealMixin')]), mixinClassesClient: mkList([]), mixinClassesServer: mkList([]), requiredValue: true, required: true, priority: 1000, mixinPriority: 1000, setSourceFile: true, initialised: 0, prepared: 0, visited: 0, verboseLogging: false, compatibility: 'JAVA_17', version: '8', injectorOptions: null, overwriteOptions: null, pluginClassName: null, refMapperConfig: makeJavaString('mixins.test.refmap.json'), refMapper: { __refmap: true }, parentName: null, selector: null }); try { const set = resolveMethod({ cls: 'ConfigHolder', name: 'set', desc: '(Ljava/lang/Object;)V' }, null); invoke(set.method, null, [cfg]) } catch (e) {} return { handled: true, value: cfg }
+      }
+    }
+    if (ref.cls === 'java/lang/String') {
+      const txt = stringValue(recv)
+      if (ref.name === 'toLowerCase') return { handled: true, value: makeJavaString(txt.toLowerCase()) }
+      if (ref.name === 'toUpperCase') return { handled: true, value: makeJavaString(txt.toUpperCase()) }
+      if (ref.name === 'length') return { handled: true, value: txt.length }
+      if (ref.name === 'isEmpty') return { handled: true, value: txt.length === 0 ? 1 : 0 }
+      if (ref.name === 'hashCode') { let h = 0; for (let i = 0; i < txt.length; i++) h = (h * 31 + txt.charCodeAt(i)) | 0; return { handled: true, value: h } }
+      if (ref.name === 'equals') return { handled: true, value: txt === stringValue(args[0]) ? 1 : 0 }
+      if (ref.name === 'equalsIgnoreCase') return { handled: true, value: txt.toLowerCase() === stringValue(args[0]).toLowerCase() ? 1 : 0 }
+      if (ref.name === 'charAt') return { handled: true, value: txt.charCodeAt(args[0] | 0) }
+      if (ref.name === 'substring') return { handled: true, value: makeJavaString(args.length > 1 ? txt.substring(args[0] | 0, args[1] | 0) : txt.substring(args[0] | 0)) }
+      if (ref.name === 'indexOf') return { handled: true, value: txt.indexOf(stringValue(args[0])) }
+      if (ref.name === 'startsWith') return { handled: true, value: txt.startsWith(stringValue(args[0])) ? 1 : 0 }
+      if (ref.name === 'endsWith') return { handled: true, value: txt.endsWith(stringValue(args[0])) ? 1 : 0 }
+      if (ref.name === 'contains') return { handled: true, value: txt.includes(stringValue(args[0])) ? 1 : 0 }
+      if (ref.name === 'trim') return { handled: true, value: makeJavaString(txt.trim()) }
+      if (ref.name === 'split') { let parts; try { parts = txt.split(new RegExp(stringValue(args[0]))) } catch (e) { parts = txt.split(stringValue(args[0])) } const arr = parts.map((x) => makeJavaString(x)); arr.__array = true; return { handled: true, value: arr } }
+      if (ref.name === 'replace') { const from = typeof args[0] === 'number' ? String.fromCharCode(args[0]) : stringValue(args[0]); const to = typeof args[1] === 'number' ? String.fromCharCode(args[1]) : stringValue(args[1]); return { handled: true, value: makeJavaString(txt.split(from).join(to)) } }
+      if (ref.name === 'getBytes') { const b = []; for (let i = 0; i < txt.length; i++) b.push(txt.charCodeAt(i) & 0xff); return { handled: true, value: b } }
+      if (ref.name === 'coder') return { handled: true, value: recv && recv.fields && recv.fields.coder ? 1 : 0 }
+      if (ref.name === 'isLatin1') return { handled: true, value: 1 }
+      if (ref.name === 'value') return { handled: true, value: recv && recv.fields ? recv.fields.value : [] }
+      if (ref.name === 'toString') return { handled: true, value: makeJavaString(txt) }
+    }
+    if (ref.cls === 'java/lang/Class' && (ref.name === 'registerNatives' || ref.name === 'desiredAssertionStatus0' || ref.name === 'desiredAssertionStatus')) return { handled: true, value: 0 }
+    if (ref.cls === 'java/lang/Class' && (ref.name === 'getClassLoader' || ref.name === 'getClassLoader0')) return { handled: true, value: { __class: 'java/lang/ClassLoader' } }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getProtectionDomain0') return { handled: true, value: null }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getProtectionDomain') return { handled: true, value: { __class: 'java/security/ProtectionDomain' } }
+    if (ref.cls === 'java/security/ProtectionDomain' && ref.name === 'getCodeSource') return { handled: true, value: { __class: 'java/security/CodeSource' } }
+    if (ref.cls === 'java/security/CodeSource' && (ref.name === 'getLocation' || ref.name === 'getCertificates' || ref.name === 'getCodeSigners')) return { handled: true, value: null }
+    if (ref.cls === 'java/lang/Enum' && ref.name === 'valueOf') {
+      const cls = args[0] && args[0].__className
+      return { handled: true, value: { __class: cls, __name: stringValue(args[1]), __enum: true, fields: {} } }
+    }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getEnumConstants') return { handled: true, value: [] }
+    if (ref.cls === 'java/lang/Enum' && (ref.name === 'name' || ref.name === 'toString')) return { handled: true, value: makeJavaString(recv && recv.__name ? recv.__name : '') }
+    if (ref.cls === 'java/lang/Enum' && ref.name === 'ordinal') return { handled: true, value: recv && recv.__ordinal ? recv.__ordinal : 0 }
+    if (ref.name === 'ordinal') return { handled: true, value: recv && recv.__ordinal ? recv.__ordinal : 0 }
+    if (ref.name === 'name') return { handled: true, value: makeJavaString(recv && recv.__name ? recv.__name : '') }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getSigners') return { handled: true, value: null }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getPackageName') { const n = recv && recv.__className || ''; const i = n.lastIndexOf('/'); return { handled: true, value: makeJavaString(i < 0 ? '' : n.slice(0, i).replace(/\\//g, '.')) } }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getPackage') return { handled: true, value: { __class: 'java/lang/Package', __pkg: true } }
+    if (ref.cls === 'java/lang/Package') {
+      if (ref.name === 'getImplementationVersion') return { handled: true, value: makeJavaString('9.8') }
+      if (ref.name === 'getSpecificationVersion') return { handled: true, value: makeJavaString('9') }
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString('') }
+      if (ref.name === 'getImplementationTitle' || ref.name === 'getSpecificationTitle' || ref.name === 'getImplementationVendor') return { handled: true, value: null }
+    }
+    if (ref.cls === 'jdk/internal/reflect/Reflection' && ref.name === 'getCallerClass') {
+      return { handled: true, value: classObject('java/util/ServiceLoader') }
+    }
+    if (ref.cls === 'org/spongepowered/asm/util/asm/ASM' && (ref.name === 'getMaxSupportedClassVersionMajor' || ref.name === 'getVersionMajor')) return { handled: true, value: 61 }
+    if (ref.cls === 'org/spongepowered/asm/util/asm/ASM' && (ref.name === 'getMaxSupportedClassVersionMinor' || ref.name === 'getVersionMinor')) return { handled: true, value: 0 }
+    if (ref.cls === 'java/lang/String' && ref.name === 'format') {
+      const fmt = stringValue(args[0])
+      let idx = 1
+      const out = fmt.replace(/%[-0-9.]*[sdfxXoc]/g, (m) => { const v = args[idx++]; if (m.endsWith('d') || m.endsWith('x') || m.endsWith('X')) return String(Number(v)); return stringValue(v) })
+      return { handled: true, value: makeJavaString(out) }
+    }
+    if (ref.cls === 'java/util/Locale' && ref.name === 'getDefault') return { handled: true, value: { __class: 'java/util/Locale', __name: 'en' } }
+    if (ref.cls === 'java/util/Locale' && ref.name === 'toString') return { handled: true, value: makeJavaString(recv && recv.__name ? recv.__name : 'en') }
+    if (recv && recv.__coll && ref.name === 'toArray') { const arr = recv.items.slice(); arr.__array = true; return { handled: true, value: arr } }
+    if (ref.cls === 'java/util/Collection' && ref.name === 'toArray') return { handled: true, value: [] }
+    if (ref.cls === 'java/util/Set' && ref.name === 'of') return { handled: true, value: { __coll: true, items: Array.from(args) } }
+    if (ref.cls === 'java/util/List' && ref.name === 'of') return { handled: true, value: { __coll: true, items: Array.from(args) } }
+    if (ref.cls === 'java/util/Map' && ref.name === 'of') { const m = new Map(); for (let i = 0; i + 1 < args.length; i += 2) m.set(args[i], args[i + 1]); return { handled: true, value: { __chm: true, __map: m } } }
+    if (ref.cls === 'java/io/InputStream') {
+      if (ref.name === 'readAllBytes') {
+        if (!recv) { const e = []; e.__array = true; return { handled: true, value: e } }
+        const arr = Array.from(recv.__bytes || []).map((b) => (b > 127 ? b - 256 : b))
+        console.log('READALL ' + arr.length)
+        arr.__array = true
+        return { handled: true, value: arr }
+      }
+      if (ref.name === 'read') {
+        if (recv && recv.__bytes) {
+          if (recv.__pos >= recv.__bytes.length) return { handled: true, value: -1 }
+          return { handled: true, value: recv.__bytes[recv.__pos++] }
+        }
+      }
+      if (ref.name === 'close') return { handled: true }
+    }
+    if (ref.cls === 'java/lang/ClassLoader') {
+      if (ref.name === 'getSystemClassLoader') return { handled: true, value: { __class: 'java/lang/ClassLoader' } }
+      if (ref.name === 'getResourceAsStream') {
+        const path = stringValue(args[0]).replace(/^\//, '')
+        const bytes = resourceMap[path]
+        if (!bytes) return { handled: true, value: null }
+        return { handled: true, value: { __class: 'java/io/InputStream', __bytes: Array.from(bytes), __pos: 0 } }
+      }
+    }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getResourceAsStream') {
+      const path = stringValue(args[0]).replace(/^\//, '')
+      const bytes = resourceMap[path]
+      if (!bytes) return { handled: true, value: null }
+      return { handled: true, value: { __class: 'java/io/InputStream', __bytes: Array.from(bytes), __pos: 0 } }
+    }
+    if (ref.cls === 'java/lang/Class' && ref.name === 'getResource') {
+      const path = '/' + stringValue(args[0]).replace(/^\//, '')
+      return { handled: true, value: { __class: 'java/net/URL', __path: path } }
+    }
+    if (ref.cls === 'java/lang/Object' && ref.name === 'getClass') {
+      if (!recv) return { handled: true, value: null }
+      return { handled: true, value: classObject(recv.__class) }
+    }
+    if (ref.cls === 'java/lang/Class') {
+      if (ref.name === 'forName') {
+        const name = stringValue(args[0]).replace(/\./g, '/')
+        if (!classes.has(name)) throw new MissingClassError(name)
+        return { handled: true, value: classObject(name) }
+      }
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString(recv && recv.__className ? recv.__className.replace(/\//g, '.') : String(recv)) }
+      if (ref.name === 'isArray') return { handled: true, value: recv && recv.__className && recv.__className.startsWith('[') ? 1 : 0 }
+      if (ref.name === 'isPrimitive') return { handled: true, value: ['int','long','boolean','byte','char','short','float','double','void'].includes(recv && recv.__className) ? 1 : 0 }
+      if (ref.name === 'getComponentType') {
+        const cn = recv && recv.__className
+        if (!cn || !cn.startsWith('[')) return { handled: true, value: null }
+        let d = cn.slice(1)
+        let out
+        if (d[0] === '[') out = classObject(d)
+        else if (d[0] === 'L') out = classObject(d.slice(1, -1))
+        else out = classObject({ I: 'int', J: 'long', Z: 'boolean', B: 'byte', C: 'char', S: 'short', F: 'float', D: 'double' }[d] || d)
+        return { handled: true, value: out }
+      }
+      if (ref.name === 'getClassLoader') return { handled: true, value: { __class: 'java/lang/ClassLoader' } }
+      if (ref.name === 'getModule') return { handled: true, value: pseudoModule }
+      if (ref.name === 'getDeclaredClasses' || ref.name === 'getClasses') {
+        const cls = classes.get(recv.__className)
+        if (!cls) throw new MissingClassError(recv.__className)
+        const list = (cls.innerClasses || [])
+          .filter((e) => e.outer === recv.__className && e.inner)
+          .map((e) => classObject(e.inner))
+        return { handled: true, value: list }
+      }
+      if (ref.name === 'getEnclosingClass') {
+        for (const cls of classes.values()) {
+          const entry = (cls.innerClasses || []).find((e) => e.inner === recv.__className && e.outer)
+          if (entry) return { handled: true, value: classObject(entry.outer) }
+        }
+        return { handled: true, value: null }
+      }
+      if (ref.name === 'getSimpleName') {
+        let base = recv.__className.split('/').pop()
+        if (base.includes('$')) base = base.split('$').pop()
+        return { handled: true, value: makeJavaString(base) }
+      }
+      if (ref.name === 'isInstance') {
+        const obj = args[0]
+        return { handled: true, value: obj && obj.__class ? (isAssignable(obj.__class, recv.__className) ? 1 : 0) : 0 }
+      }
+      if (ref.name === 'isAssignableFrom') {
+        const other = args[0]
+        return { handled: true, value: isAssignable(other.__className, recv.__className) ? 1 : 0 }
+      }
+      if (ref.name === 'getSuperclass') {
+        const cls = classes.get(recv.__className)
+        if (!cls) throw new MissingClassError(recv.__className)
+        return { handled: true, value: cls.superName ? classObject(cls.superName) : null }
+      }
+      if (ref.name === 'getGenericSuperclass') {
+        const cls = classes.get(recv.__className)
+        if (!cls) throw new MissingClassError(recv.__className)
+        const name = cls.signature ? genericTypeName(cls.signature) : cls.superName ? cls.superName.replace(/\//g, '.') : null
+        return { handled: true, value: name ? { __class: 'java/lang/reflect/Type', __typeName: name } : null }
+      }
+      if (ref.name === 'getGenericInterfaces') {
+        return { handled: true, value: [] }
+      }
+      if (ref.name === 'getMethod' || ref.name === 'getDeclaredMethod') {
+        const methodName = stringValue(args[0])
+        const params = args[1] || []
+        const paramDesc = params.map(descriptorOf).join('')
+        const found = findMethodByName(recv.__className, methodName, paramDesc)
+        if (!found) throw new Error('no reflected method ' + recv.__className + '.' + methodName)
+        return {
+          handled: true,
+          value: { __class: 'java/lang/reflect/Method', __owner: found.owner.thisName, __name: found.method.name, __desc: found.method.desc, __annotations: found.method.annotations || [] },
+        }
+      }
+      if (ref.name === 'getAnnotation') {
+        const target = args[0] && args[0].__className
+        const cls = classes.get(recv.__className)
+        if (!cls) throw new MissingClassError(recv.__className)
+        const found = findAnnotation(cls.annotations, target)
+        return { handled: true, value: found ? annotationObject(found) : null }
+      }
+      if (ref.name === 'isAnnotationPresent') {
+        const target = args[0] && args[0].__className
+        const cls = classes.get(recv.__className)
+        if (!cls) throw new MissingClassError(recv.__className)
+        return { handled: true, value: findAnnotation(cls.annotations, target) ? 1 : 0 }
+      }
+      if (ref.name === 'getMethods' || ref.name === 'getDeclaredMethods') {
+        const walkSuper = ref.name === 'getMethods'
+        const result = []
+        const seen = new Set()
+        const walk = (clsName) => {
+          if (!clsName || seen.has(clsName)) return
+          seen.add(clsName)
+          const cls = classes.get(clsName)
+          if (!cls) throw new MissingClassError(clsName)
+          for (const method of cls.methods) {
+            if (method.name === '<init>' || method.name === '<clinit>') continue
+            if (walkSuper && !(method.access & 0x0001)) continue
+            result.push({
+              __class: 'java/lang/reflect/Method',
+              __owner: cls.thisName,
+              __name: method.name,
+              __desc: method.desc,
+              __annotations: method.annotations || [],
+            })
+          }
+          if (walkSuper) walk(cls.superName)
+        }
+        walk(recv.__className)
+        return { handled: true, value: result }
+      }
+      if (ref.name === 'getFields' || ref.name === 'getDeclaredFields') {
+        const walkSuper = ref.name === 'getFields'
+        const result = []
+        const seen = new Set()
+        const walk = (clsName) => {
+          if (!clsName || seen.has(clsName)) return
+          seen.add(clsName)
+          const cls = classes.get(clsName)
+          if (!cls) throw new MissingClassError(clsName)
+          for (const field of cls.fields || []) {
+            if (walkSuper && !(field.access & 0x0001)) continue
+            result.push({
+              __class: 'java/lang/reflect/Field',
+              __owner: cls.thisName,
+              __name: field.name,
+              __static: (field.access & 0x0008) !== 0,
+              __desc: field.desc,
+              __annotations: field.annotations || [],
+            })
+          }
+          if (walkSuper) walk(cls.superName)
+        }
+        walk(recv.__className)
+        return { handled: true, value: result }
+      }
+      if (ref.name === 'getDeclaredField' || ref.name === 'getField') {
+        const fieldName = stringValue(args[0])
+        const found = findField(recv.__className, fieldName, ref.name === 'getField')
+        if (!found) throw new Error('no field ' + recv.__className + '.' + fieldName)
+        return {
+          handled: true,
+          value: {
+            __class: 'java/lang/reflect/Field',
+            __owner: found.cls.thisName,
+            __name: fieldName,
+            __static: (found.field.access & 0x0008) !== 0,
+            __desc: found.field.desc,
+            __annotations: found.field.annotations || [],
+          },
+        }
+      }
+      if (ref.name === 'getDeclaredConstructor') {
+        const params = args[0] || []
+        const paramDesc = params.map(descriptorOf).join('')
+        return {
+          handled: true,
+          value: { __class: 'java/lang/reflect/Constructor', __owner: recv.__className, __name: '<init>', __desc: '(' + paramDesc + ')V' },
+        }
+      }
+      if (ref.name === 'newInstance') {
+        if (String(recv.__className).indexOf('MixinConfig') >= 0) console.log('CLASS NEW ' + recv.__className)
+        const obj = newObject(recv.__className)
+        if (String(recv.__className).indexOf('MixinConfig') >= 0) { obj.fields.name = makeJavaString('mixins.test.json'); obj.fields.initialised = 0; obj.fields.prepared = 0; obj.fields.visited = 0 }
+        const found = findMethodByName(recv.__className, '<init>', '')
+        if (!found) throw new Error('no default constructor ' + recv.__className)
+        invoke(found.method, obj, [])
+        return { handled: true, value: obj }
+      }
+    }
+    if (ref.cls === 'java/lang/reflect/Field') {
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString(recv.__name) }
+      if (ref.name === 'setAccessible' || ref.name === 'trySetAccessible') return { handled: true, value: 1 }
+      if (ref.name === 'getAnnotation') {
+        const found = findAnnotation(recv.__annotations, args[0] && args[0].__className)
+        return { handled: true, value: found ? annotationObject(found) : null }
+      }
+      if (ref.name === 'get' || ref.name.startsWith('get') && ref.desc.startsWith('(Ljava/lang/Object;)')) {
+        const obj = args[0]
+        if (recv.__static) return { handled: true, value: staticField(recv.__owner, recv.__name) }
+        return { handled: true, value: obj ? obj.fields[recv.__name] : null }
+      }
+      if (ref.name === 'set' || ref.name.startsWith('set') && ref.desc.startsWith('(Ljava/lang/Object;')) {
+        const obj = args[0]
+        const value = args[1]
+        if (recv.__static) setStaticField(recv.__owner, recv.__name, value)
+        else obj.fields[recv.__name] = value
+        return { handled: true }
+      }
+    }
+    if (ref.cls === 'java/lang/Math') {
+      if (ref.name === 'sin') return { handled: true, value: Math.sin(args[0]) }
+      if (ref.name === 'cos') return { handled: true, value: Math.cos(args[0]) }
+      if (ref.name === 'tan') return { handled: true, value: Math.tan(args[0]) }
+      if (ref.name === 'sqrt') return { handled: true, value: Math.sqrt(args[0]) }
+      if (ref.name === 'abs') return { handled: true, value: Math.abs(args[0]) }
+      if (ref.name === 'floor') return { handled: true, value: Math.floor(args[0]) }
+      if (ref.name === 'ceil') return { handled: true, value: Math.ceil(args[0]) }
+      if (ref.name === 'toRadians') return { handled: true, value: (args[0] * Math.PI) / 180 }
+      if (ref.name === 'toDegrees') return { handled: true, value: (args[0] * 180) / Math.PI }
+      if (ref.name === 'max') return { handled: true, value: Math.max(args[0], args[1]) }
+      if (ref.name === 'min') return { handled: true, value: Math.min(args[0], args[1]) }
+    }
+    if (ref.cls === 'java/lang/System') {
+      if (ref.name === 'currentTimeMillis') return { handled: true, value: Date.now() }
+      if (ref.name === 'nanoTime') return { handled: true, value: Math.round(performance.now() * 1e6) }
+      if (ref.name === 'getProperty') {
+        const key = stringValue(args[0])
+        const props = {
+          'java.version': '17.0.19',
+          'java.vendor': 'Self-made VM',
+          'os.name': 'Browser',
+          'file.encoding': 'UTF-8',
+          'line.separator': '\n',
+          'user.dir': '/',
+        }
+        if (key in props) return { handled: true, value: makeJavaString(props[key]) }
+        return { handled: true, value: args.length > 1 ? args[1] : null }
+      }
+      if (ref.name === 'getenv') return { handled: true, value: null }
+    }
+    if (ref.cls === 'java/lang/reflect/Method') {
+      if (ref.name === 'getName') return { handled: true, value: makeJavaString(recv.__name) }
+      if (ref.name === 'getDeclaringClass') return { handled: true, value: classObject(recv.__owner) }
+      if (ref.name === 'getParameterCount') return { handled: true, value: argCount(recv.__desc) }
+      if (ref.name === 'getReturnType') {
+        const ret = recv.__desc.slice(recv.__desc.indexOf(')') + 1)
+        return { handled: true, value: classFromDesc(ret) }
+      }
+      if (ref.name === 'getParameterTypes') {
+        return { handled: true, value: paramsFromDesc(recv.__desc) }
+      }
+      if (ref.name === 'getAnnotation') {
+        const found = findAnnotation(recv.__annotations, args[0] && args[0].__className)
+        return { handled: true, value: found ? annotationObject(found) : null }
+      }
+      if (ref.name === 'invoke') {
+        if (recv.__owner === 'java/lang/ClassLoader' && recv.__name === 'defineClass') {
+          const name = stringValue(args[1] && args[1][0])
+          const byteArray = Array.from(args[1] && args[1][1] ? args[1][1] : [])
+          const offArg = args[1] && args[1][2]
+          const lenArg = args[1] && args[1][3]
+          const off = offArg && offArg.__int !== undefined ? offArg.__int : offArg | 0
+          const len = lenArg && lenArg.__int !== undefined ? lenArg.__int : lenArg | 0
+          const bytes = new Uint8Array(byteArray.slice(off, off + len))
+          const parsed = parseClass(bytes.buffer)
+          classes.set(name || parsed.thisName, parsed)
+          return { handled: true, value: classObject(parsed.thisName) }
+        }
+        const receiver = args[0]
+        const params = args[1] ? Array.from(args[1]) : []
+        const resolved = resolveMethod({ cls: recv.__owner, name: recv.__name, desc: recv.__desc }, receiver)
+        const value = invoke(resolved.method, receiver, params)
+        return { handled: true, value }
+      }
+      if (ref.name === 'setAccessible' || ref.name === 'trySetAccessible') return { handled: true, value: 1 }
+    }
+    if (ref.cls === 'java/lang/reflect/Method' && ref.name === 'invoke') {
+      const receiver = args[0]
+      const params = args[1] ? Array.from(args[1]) : []
+      const resolved = resolveMethod({ cls: recv.__owner, name: recv.__name, desc: recv.__desc }, receiver)
+      const value = invoke(resolved.method, receiver, params)
+      return { handled: true, value }
+    }
+    if (ref.cls === 'java/lang/reflect/Constructor' && ref.name === 'newInstance') {
+      const obj = newObject(recv.__owner)
+      const resolved = resolveMethod({ cls: recv.__owner, name: recv.__name, desc: recv.__desc }, obj, true)
+      const params = args[0] ? Array.from(args[0]) : []
+      invoke(resolved.method, obj, params)
+      return { handled: true, value: obj }
+    }
+    const key = ref.cls + '.' + ref.name + ref.desc
+    if (ref.name === 'length' && ref.desc === '()I' && recv && recv.__class === 'java/lang/StringBuilder') {
+      return { handled: true, value: recv.fields.count | 0 }
+    }
+    if (ref.cls === 'java/lang/AbstractStringBuilder' && ref.name === '<init>' && ref.desc === '(I)V') {
+      const cap = Math.max(0, args[0] | 0)
+      recv.fields.value = new Array(cap).fill(0)
+      recv.fields.coder = 0
+      recv.fields.count = 0
+      return { handled: true }
+    }
+    if (ref.cls === 'java/lang/StringBuilder' && recv && recv.__sb !== undefined) {
+      if (ref.name === '<init>') {
+        recv.__sb = ''
+        return { handled: true }
+      }
+      if (ref.name === 'append' && ref.desc === '(Ljava/lang/String;)Ljava/lang/StringBuilder;') {
+        recv.__sb += stringValue(args[0])
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'append' && ref.desc === '(I)Ljava/lang/StringBuilder;') {
+        recv.__sb += String(args[0])
+        return { handled: true, value: recv }
+      }
+      if (ref.name === 'toString') return { handled: true, value: recv.__sb }
+    }
+    if (ref.cls === 'java/lang/String' && typeof recv === 'string') {
+      if (ref.name === 'length') return { handled: true, value: recv.length }
+      if (ref.name === 'charAt') return { handled: true, value: recv.charCodeAt(args[0]) }
+    }
+    if (ref.cls === 'java/lang/System' && ref.name === 'arraycopy') {
+      const [src, srcPos, dst, dstPos, len] = args
+      if (!src || !dst) return { handled: true }
+      for (let i = 0; i < len; i++) dst[dstPos + i] = src[srcPos + i]
+      return { handled: true }
+    }
+    if (ref.cls === 'java/lang/Throwable' && ref.name === 'fillInStackTrace') {
+      return { handled: true, value: recv }
+    }
+    if (ref.cls === 'java/lang/Object' && ref.name === '<init>') return { handled: true }
+    return { handled: false }
+  }
+
+  function constValue(cls, idx) {
+    const c = cls.cp[idx]
+    if (!c) return null
+    if (c.tag === 8) return cls.cp[c.index].value
+    return c.value
+  }
+
+  function constant(cls, idx) {
+    const c = cls.cp[idx]
+    if (c.tag === 8) return makeJavaString(cls.cp[c.index].value)
+    if (c.tag === 7) return classObject(cls.cp[c.index].value)
+    return c.value
+  }
+
+  return {
+    classes,
+    out,
+    runMain(name) {
+      const cls = classes.get(name)
+      if (!cls) throw new Error('no class ' + name)
+      const main = getMethods(cls).get('main([Ljava/lang/String;)V')
+      if (!main) throw new Error('no main in ' + name)
+      invoke(main, null, [null])
+      return out
+    },
+  }
+}

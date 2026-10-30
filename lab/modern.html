@@ -1,0 +1,140 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JVM from scratch 路 modern GL</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 920px; margin: 40px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 20px; }
+      canvas { width: 100%; max-width: 800px; aspect-ratio: 8 / 5; background: #000; border: 1px solid #2a241a; display: block; }
+      .meta { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0; color: #b9a98c; font-size: 12px; }
+      .meta b { color: #d9ab5e; font-weight: 500; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 12px; white-space: pre-wrap; margin: 0; min-height: 40px; }
+      .err { color: #e06b6b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>JVM from scratch - modern GL</h1>
+      <div class="sub">Java shaders / VBO / drawArrays bridged to WebGL</div>
+      <div class="meta" id="meta"></div>
+      <canvas id="gl" width="800" height="500"></canvas>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+
+      const out = document.getElementById('out')
+      const meta = document.getElementById('meta')
+      const canvas = document.getElementById('gl')
+      const gl = canvas.getContext('webgl', { antialias: true })
+
+      const shaders = new Map()
+      const programs = new Map()
+      let nextShader = 1
+      let nextProgram = 1
+      let nextBuffer = 1
+      let boundBuffer = null
+      let currentProgram = null
+      let clearColorValue = [0, 0, 0, 1]
+
+      const compile = (type, src) => {
+        const s = gl.createShader(type)
+        gl.shaderSource(s, src)
+        gl.compileShader(s)
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+          throw new Error('shader: ' + gl.getShaderInfoLog(s))
+        }
+        return s
+      }
+
+      const hooks = {
+        createShader(type) {
+          const id = nextShader++
+          shaders.set(id, { type: type === 0x8B30 ? gl.FRAGMENT_SHADER : gl.VERTEX_SHADER, src: '', compiled: null })
+          return id
+        },
+        shaderSource(id, src) {
+          shaders.get(id).src = src
+        },
+        compileShader(id) {
+          const entry = shaders.get(id)
+          entry.compiled = compile(entry.type || gl.VERTEX_SHADER, entry.src)
+        },
+        createProgram() {
+          const id = nextProgram++
+          programs.set(id, { program: gl.createProgram(), shaders: [] })
+          return id
+        },
+        attachShader(p, s) {
+          const entry = programs.get(p)
+          const sh = shaders.get(s)
+          entry.shaders.push(sh)
+          gl.attachShader(entry.program, sh.compiled)
+        },
+        linkProgram(p) {
+          const entry = programs.get(p)
+          gl.bindAttribLocation(entry.program, 0, 'pos')
+          gl.linkProgram(entry.program)
+          if (!gl.getProgramParameter(entry.program, gl.LINK_STATUS)) {
+            throw new Error('link: ' + gl.getProgramInfoLog(entry.program))
+          }
+        },
+        useProgram(p) {
+          currentProgram = programs.get(p)
+          gl.useProgram(currentProgram.program)
+        },
+        getAttribLocation() {
+          return 0
+        },
+        enableVertexAttribArray(loc) {
+          gl.enableVertexAttribArray(loc)
+        },
+        genBuffers() {
+          return nextBuffer++
+        },
+        bindBuffer(target, id) {
+          boundBuffer = id
+        },
+        bufferData(target, floats) {
+          const buffer = gl.createBuffer()
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(floats), gl.STATIC_DRAW)
+        },
+        vertexAttribPointer(loc, size, type, normalized, stride) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, gl.getParameter(gl.ARRAY_BUFFER_BINDING))
+          gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, 0)
+        },
+        clearColor(r, g, b, a) {
+          clearColorValue = [r, g, b, a]
+        },
+        clear() {
+          gl.viewport(0, 0, canvas.width, canvas.height)
+          gl.clearColor(...clearColorValue)
+          gl.clear(gl.COLOR_BUFFER_BIT)
+        },
+        drawArrays(mode, first, count) {
+          gl.drawArrays(gl.TRIANGLES, first, count)
+          out.dataset.drawn = '1'
+        },
+        viewport() {},
+      }
+
+      ;(async () => {
+        try {
+          const cls = parseClass(await fetch('./TriangleModern.class').then((r) => r.arrayBuffer()))
+          const vm = createVM2([cls], {}, { gl: hooks })
+          vm.runMain('TriangleModern')
+          meta.innerHTML = '<span>classes <b>1</b></span><span>pipeline <b>shader + VBO + drawArrays</b></span>'
+          out.textContent = 'Java: glCreateShader/glShaderSource/glLinkProgram/glBufferData/glDrawArrays done'
+        } catch (e) {
+          out.innerHTML = '<span class="err">' + String(e && e.stack ? e.stack : e) + '</span>'
+        }
+      })()
+    </script>
+  </body>
+</html>
