@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JVM from scratch - texture</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 920px; margin: 40px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 20px; }
+      canvas { width: 100%; max-width: 800px; aspect-ratio: 8 / 5; background: #000; border: 1px solid #2a241a; display: block; }
+      .meta { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0; color: #b9a98c; font-size: 12px; }
+      .meta b { color: #d9ab5e; font-weight: 500; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 12px; white-space: pre-wrap; margin: 0; min-height: 40px; }
+      .err { color: #e06b6b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>JVM from scratch - texture</h1>
+      <div class="sub">Java: uniform mat4 + sampler2D + glTexImage2D -&gt; WebGL</div>
+      <div class="meta" id="meta"></div>
+      <canvas id="gl" width="800" height="500"></canvas>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+
+      const out = document.getElementById('out')
+      const meta = document.getElementById('meta')
+      const canvas = document.getElementById('gl')
+      const gl = canvas.getContext('webgl', { antialias: true })
+
+      const shaders = new Map()
+      const programs = new Map()
+      const uniformIds = new Map()
+      let nextShader = 1
+      let nextProgram = 1
+      let nextBuffer = 1
+      let nextTexture = 1
+      let uniformSeq = 1
+      let currentProgram = null
+      let currentTexture = null
+      let clearColorValue = [0, 0, 0, 1]
+
+      const compile = (type, src) => {
+        const s = gl.createShader(type)
+        gl.shaderSource(s, src)
+        gl.compileShader(s)
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error('shader: ' + gl.getShaderInfoLog(s))
+        return s
+      }
+
+      const hooks = {
+        createShader(type) {
+          const id = nextShader++
+          shaders.set(id, { type: type === 0x8b30 ? gl.FRAGMENT_SHADER : gl.VERTEX_SHADER, src: '', compiled: null })
+          return id
+        },
+        shaderSource(id, src) {
+          shaders.get(id).src = src
+        },
+        compileShader(id) {
+          const entry = shaders.get(id)
+          entry.compiled = compile(entry.type, entry.src)
+        },
+        createProgram() {
+          const id = nextProgram++
+          programs.set(id, { program: gl.createProgram(), shaders: [] })
+          return id
+        },
+        attachShader(p, s) {
+          const entry = programs.get(p)
+          entry.shaders.push(shaders.get(s))
+          gl.attachShader(entry.program, shaders.get(s).compiled)
+        },
+        linkProgram(p) {
+          const entry = programs.get(p)
+          gl.bindAttribLocation(entry.program, 0, 'pos')
+          gl.linkProgram(entry.program)
+          if (!gl.getProgramParameter(entry.program, gl.LINK_STATUS)) {
+            throw new Error('link: ' + gl.getProgramInfoLog(entry.program))
+          }
+        },
+        useProgram(p) {
+          currentProgram = programs.get(p)
+          gl.useProgram(currentProgram.program)
+        },
+        getUniformLocation(p, name) {
+          const id = uniformSeq++
+          uniformIds.set(id, { program: programs.get(p).program, name })
+          return id
+        },
+        uniformMatrix4fv(loc, transpose, data) {
+          const entry = uniformIds.get(loc)
+          gl.uniformMatrix4fv(gl.getUniformLocation(entry.program, entry.name), false, new Float32Array(data))
+        },
+        uniform1i(loc, value) {
+          const entry = uniformIds.get(loc)
+          gl.uniform1i(gl.getUniformLocation(entry.program, entry.name), value)
+        },
+        getAttribLocation() {
+          return 0
+        },
+        enableVertexAttribArray(loc) {
+          gl.enableVertexAttribArray(loc)
+        },
+        genBuffers() {
+          return nextBuffer++
+        },
+        bindBuffer() {},
+        bufferData(target, floats) {
+          const buffer = gl.createBuffer()
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(floats), gl.STATIC_DRAW)
+        },
+        vertexAttribPointer(loc, size, type, normalized, stride) {
+          gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, 0)
+        },
+        genTextures() {
+          return nextTexture++
+        },
+        bindTexture(target, id) {
+          currentTexture = gl.createTexture()
+          gl.bindTexture(gl.TEXTURE_2D, currentTexture)
+        },
+        texParameteri(target, pname, value) {
+          gl.texParameteri(gl.TEXTURE_2D, pname, value)
+        },
+        texImage2D(target, level, internal, width, height, border, format, type, pixels) {
+          const data = new Uint8Array(pixels.map((v) => v & 0xff))
+          gl.texImage2D(gl.TEXTURE_2D, level, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data)
+        },
+        activeTexture(unit) {
+          gl.activeTexture(gl.TEXTURE0)
+        },
+        generateMipmap() {},
+        clearColor(r, g, b, a) {
+          clearColorValue = [r, g, b, a]
+        },
+        clear() {
+          gl.viewport(0, 0, canvas.width, canvas.height)
+          gl.clearColor(...clearColorValue)
+          gl.clear(gl.COLOR_BUFFER_BIT)
+        },
+        drawArrays(mode, first, count) {
+          gl.drawArrays(gl.TRIANGLES, first, count)
+        },
+        viewport() {},
+      }
+
+      ;(async () => {
+        try {
+          const cls = parseClass(await fetch('./TextureTest.class').then((r) => r.arrayBuffer()))
+          const vm = createVM2([cls], {}, { gl: hooks })
+          vm.runMain('TextureTest')
+          meta.innerHTML = '<span>classes <b>1</b></span><span>pipeline <b>uniform + texture + draw</b></span>'
+          out.textContent = 'Java: glUniformMatrix4fv / glUniform1i / glTexImage2D / glDrawArrays done'
+        } catch (e) {
+          out.innerHTML = '<span class="err">' + String(e && e.stack ? e.stack : e) + '</span>'
+        }
+      })()
+    </script>
+  </body>
+</html>

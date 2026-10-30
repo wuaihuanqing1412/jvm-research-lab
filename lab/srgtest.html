@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SRG fallback</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 920px; margin: 56px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 24px; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 16px; min-height: 160px; white-space: pre-wrap; }
+      .err { color: #e06b6b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>SRG fallback</h1>
+      <div class="sub">call site "hello" resolves to "m_999_" via srg map</div>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+
+      const out = document.getElementById('out')
+      const classes = new Map()
+      async function load(name) {
+        if (classes.has(name)) return classes.get(name)
+        for (const url of ['./' + name + '.class', './asm/' + name + '.class', './jdk/classes/' + name + '.class']) {
+          const res = await fetch(url)
+          if (res.ok) { const cls = parseClass(await res.arrayBuffer()); classes.set(name, cls); return cls }
+        }
+        throw new Error('cannot load ' + name)
+      }
+
+      const srg = { SrgTarget: { m: { 'hello ()I': 'm_999_' }, f: {} } }
+
+      ;(async () => {
+        try {
+          await load('SrgTest')
+          await load('Helper')
+          let lines = null
+          for (let i = 0; i < 120; i++) {
+            const vm = createVM2([...classes.values()], {}, {}, srg)
+            try { lines = vm.runMain('SrgTest'); break }
+            catch (e) { if (e && e.missingClass) { await load(e.missingClass); continue } throw e }
+          }
+          out.textContent = lines ? lines.join('\n') : 'no output'
+        } catch (e) {
+          out.innerHTML = '<span class="err">' + String(e && e.stack ? e.stack : e) + '</span>'
+        }
+      })()
+    </script>
+  </body>
+</html>

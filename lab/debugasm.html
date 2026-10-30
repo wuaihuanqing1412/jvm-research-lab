@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>debug asm</title>
+    <style>body{background:#08070c;color:#e8dcc2;font:14px ui-monospace,monospace;padding:40px}pre{background:#05040a;padding:16px}</style>
+  </head>
+  <body>
+    <pre id="out">loading...</pre>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+      const out = document.getElementById('out')
+      const classes = new Map()
+      async function load(name) {
+        if (classes.has(name)) return classes.get(name)
+        for (const url of ['./' + name + '.class', './asm/' + name + '.class', './jdk/classes/' + name + '.class']) {
+          const res = await fetch(url)
+          if (res.ok) { const cls = parseClass(await res.arrayBuffer()); classes.set(name, cls); return cls }
+        }
+        throw new Error('cannot load ' + name)
+      }
+      ;(async () => {
+        try {
+          await load('DebugAsm')
+          let lines = null
+          for (let i = 0; i < 200; i++) {
+            const vm = createVM2([...classes.values()])
+            try { lines = vm.runMain('DebugAsm'); break }
+            catch (e) { if (e && e.missingClass) { await load(e.missingClass); continue } throw e }
+          }
+          out.textContent = lines.join('\n')
+        } catch (e) { out.textContent = String(e && e.stack ? e.stack : e) }
+      })()
+    </script>
+  </body>
+</html>

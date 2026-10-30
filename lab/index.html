@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JVM / ASM / Mixin Lab</title>
+    <style>
+      :root { --gold: #d9ab5e; --ink: #e8dcc2; --muted: #8d8170; --line: rgba(217,171,94,.18); }
+      body { margin: 0; background: #08070c; color: var(--ink); font: 14px/1.7 ui-monospace, monospace; }
+      header { padding: 54px 0 26px; border-bottom: 1px solid var(--line); }
+      main { max-width: 1120px; margin: 0 auto; padding: 0 24px 80px; }
+      .eyebrow { color: var(--gold); font-size: 11px; letter-spacing: .22em; }
+      h1 { font: 500 40px/1.25 "Songti SC", "Noto Serif SC", serif; color: var(--gold); margin: 10px 0 8px; }
+      .lead { color: var(--muted); max-width: 70ch; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; margin-top: 26px; }
+      a.card { display: block; border: 1px solid var(--line); padding: 16px 18px; text-decoration: none; color: var(--ink); transition: border-color .2s, background .2s; }
+      a.card:hover { border-color: rgba(217,171,94,.55); background: rgba(217,171,94,.04); }
+      a.card b { display: block; color: var(--gold); font-weight: 500; margin-bottom: 4px; }
+      a.card span { color: var(--muted); font-size: 12px; }
+      .tag { display: inline-block; margin-top: 8px; font-size: 10px; letter-spacing: .12em; color: #7d7364; border: 1px solid var(--line); padding: 1px 6px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <main>
+        <div class="eyebrow">APOCALYPSE ENDS · RESEARCH LAB</div>
+        <h1>JVM / ASM / Mixin 实验室</h1>
+        <div class="lead">
+          从零实现的 Java 17 解释器、JDK 类库懒加载、ASM 字节码变换、注解驱动 Mixin，以及 Java → LWJGL → WebGL 渲染桥。
+          所有页面都在浏览器里真实执行，不依赖 JVM 插件。
+        </div>
+      </main>
+    </header>
+    <main>
+      <div class="grid">
+        <a class="card" href="./real.html"><b>真实 JDK 类</b><span>Arrays / Math 直接从 OpenJDK 17 class 文件执行</span><div class="tag">JVM</div></a>
+        <a class="card" href="./list.html"><b>ArrayList</b><span>构造 / add / size / get，懒加载 JDK 集合</span><div class="tag">JVM</div></a>
+        <a class="card" href="./str.html"><b>String / StringBuilder</b><span>真实字符串与拼接，compact string 编码</span><div class="tag">JVM</div></a>
+        <a class="card" href="./exception.html"><b>异常</b><span>athrow + 异常表 + catch 匹配</span><div class="tag">JVM</div></a>
+        <a class="card" href="./loader.html"><b>懒加载</b><span>只给一个入口类，其余运行时按需拉取</span><div class="tag">JVM</div></a>
+        <a class="card" href="./objects.html"><b>对象 / 数组</b><span>字段、构造器、数组、StringBuilder</span><div class="tag">JVM</div></a>
+        <a class="card" href="./generic.html"><b>泛型签名</b><span>Signature 属性与 getGenericSuperclass</span><div class="tag">REFLECT</div></a>
+        <a class="card" href="./anno.html"><b>注解</b><span>RuntimeVisibleAnnotations 与注解对象</span><div class="tag">REFLECT</div></a>
+        <a class="card" href="./inner.html"><b>内部类</b><span>InnerClasses / getDeclaredClasses</span><div class="tag">REFLECT</div></a>
+        <a class="card" href="./unsafe.html"><b>Unsafe</b><span>allocateInstance 绕过构造器、字段偏移写入</span><div class="tag">UNSAFE</div></a>
+        <a class="card" href="./define.html"><b>defineClass</b><span>运行期字节码 → 活类 → 反射调用</span><div class="tag">ASM</div></a>
+        <a class="card" href="./transform.html"><b>方法体变换</b><span>ClassReader → Visitor → 42 改成 123</span><div class="tag">ASM</div></a>
+        <a class="card" href="./node.html"><b>Mixin 注入</b><span>MethodNode：HEAD / RETURN / cancellable 回调</span><div class="tag">MIXIN</div></a>
+        <a class="card" href="./srgtest.html"><b>SRG 回退</b><span>hello → m_999_，1.20.1.tsrg 运行时映射</span><div class="tag">MIXIN</div></a>
+        <a class="card" href="./srg.html"><b>SRG 映射表</b><span>7436 类 / 48575 方法 / 32126 字段</span><div class="tag">DATA</div></a>
+        <a class="card" href="./modern.html"><b>现代 GL 管线</b><span>Java shader + VBO + drawArrays → WebGL</span><div class="tag">GL</div></a>
+        <a class="card" href="./pngindex.html"><b>PNG 字节 + 索引绘制</b><span>Java 读 PNG → Blob 解码 → 纹理 → EBO</span><div class="tag">GL</div></a>
+        <a class="card" href="./rotate.html"><b>旋转矩阵</b><span>Java Math 计算 mat4 → uniform → 旋转方块</span><div class="tag">GL</div></a>
+      </div>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,46 @@
+# NOTICE
+
+JVM Research Lab
+Copyright 2026 Wuai Huanqing
+
+This product includes software developed by third parties. The repository does
+not vendor these binaries; `scripts/setup.ps1` downloads them at setup time.
+
+## ASM 9.8
+
+- Project: https://asm.ow2.io/
+- License: BSD-3-Clause
+- Files: `asm-9.8.jar`, `asm-tree-9.8.jar`
+
+## SpongePowered Mixin 0.8.5
+
+- Project: https://github.com/SpongePowered/Mixin
+- License: MIT
+- File: `mixin-0.8.5.jar`
+
+## Guava 31.1-jre
+
+- Project: https://github.com/google/guava
+- License: Apache-2.0
+- File: `guava-31.1-jre.jar`
+
+## Gson 2.10
+
+- Project: https://github.com/google/gson
+- License: Apache-2.0
+- File: `gson-2.10.jar`
+
+## OpenJDK 17 class files
+
+- Project: https://openjdk.org/
+- License: GPLv2 with the Classpath Exception
+- Files: extracted from `java.base.jmod` and `java.logging.jmod` by `scripts/setup.ps1`
+
+The extracted OpenJDK class files are **not** committed to this repository.
+Redistribution of those class files is subject to the OpenJDK license, not the
+Apache-2.0 license of this project's original source.
+
+## Minecraft / Forge
+
+This project is not affiliated with Mojang, Microsoft, or SpongePowered.
+No Minecraft or Forge binaries are included.

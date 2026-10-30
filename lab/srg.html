@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SRG map</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 960px; margin: 48px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 20px; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 16px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>1.20.1.tsrg · SRG map</h1>
+      <div class="sub">official name ↔ SRG name, parsed from tsrg2</div>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      const out = document.getElementById('out')
+      ;(async () => {
+        try {
+          const res = await fetch('./srg-map.json')
+          const map = await res.json()
+          const names = Object.keys(map)
+          const mc = map['net/minecraft/client/Minecraft'] || { m: {}, f: {} }
+          const entries = Object.entries(mc.m)
+          const sample = entries.slice(0, 5)
+          const rev = new Map()
+          for (const [key, srg] of entries) rev.set(srg, key)
+
+          let text = 'classes: ' + names.length + '\n'
+          text += 'Minecraft methods: ' + entries.length + '\n\n'
+          for (const [key, srg] of sample) text += key + '  ->  ' + srg + '\n'
+          if (entries.length) {
+            const srg = entries[0][1]
+            text += '\nreverse: ' + srg + '  ->  ' + rev.get(srg)
+          }
+          out.textContent = text
+        } catch (e) {
+          out.textContent = String(e && e.stack ? e.stack : e)
+        }
+      })()
+    </script>
+  </body>
+</html>

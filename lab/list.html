@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JVM from scratch · ArrayList</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 900px; margin: 56px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 24px; }
+      .meta { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 16px; color: #b9a98c; font-size: 12px; }
+      .meta b { color: #d9ab5e; font-weight: 500; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 16px; min-height: 220px; white-space: pre-wrap; margin: 0; }
+      .err { color: #e06b6b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>JVM from scratch · ArrayList</h1>
+      <div class="sub">执行 OpenJDK 17 的 java.util.ArrayList：构造、add、size、get</div>
+      <div class="meta" id="meta"></div>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+
+      const out = document.getElementById('out')
+      const meta = document.getElementById('meta')
+      let vm = null
+      ;(async () => {
+        try {
+          const load = async (url) => parseClass(await fetch(url).then((r) => r.arrayBuffer()))
+          const paths = [
+            './ListTest.class',
+            './jdk/classes/java/util/ArrayList.class',
+            './jdk/classes/java/util/AbstractList.class',
+            './jdk/classes/java/util/AbstractCollection.class',
+            './jdk/classes/java/util/Objects.class',
+            './jdk/classes/jdk/internal/util/Preconditions.class',
+            './jdk/classes/jdk/internal/util/ArraysSupport.class',
+            './jdk/classes/java/lang/Object.class',
+            './jdk/classes/java/lang/Math.class',
+          ]
+          const classes = await Promise.all(paths.map(load))
+          vm = createVM2(classes)
+          const lines = vm.runMain('ListTest')
+          meta.innerHTML =
+            '<span>classes <b>' + vm.classes.size + '</b></span>' +
+            '<span>source <b>OpenJDK 17</b></span>' +
+            '<span>mode <b>interpreter</b></span>'
+          out.textContent = lines.join('\n')
+        } catch (e) {
+          out.innerHTML = '<span class="err">' + (vm ? vm.out.join('\n') + '\n\n' : '') + String(e && e.stack ? e.stack : e) + '</span>'
+        }
+      })()
+    </script>
+  </body>
+</html>

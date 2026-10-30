@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JVM from scratch · LWJGL → WebGL</title>
+    <style>
+      body { margin: 0; background: #08070c; color: #e8dcc2; font: 14px/1.7 ui-monospace, monospace; }
+      main { max-width: 920px; margin: 40px auto; padding: 0 20px; }
+      h1 { font-size: 24px; color: #d9ab5e; margin-bottom: 4px; }
+      .sub { color: #8d8170; margin-bottom: 20px; }
+      canvas { width: 100%; max-width: 800px; aspect-ratio: 8 / 5; background: #000; border: 1px solid #2a241a; display: block; }
+      .meta { display: flex; gap: 18px; flex-wrap: wrap; margin: 14px 0; color: #b9a98c; font-size: 12px; }
+      .meta b { color: #d9ab5e; font-weight: 500; }
+      pre { background: #05040a; border: 1px solid #2a241a; padding: 12px; white-space: pre-wrap; margin: 0; min-height: 40px; }
+      .err { color: #e06b6b; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>JVM from scratch · LWJGL → WebGL</h1>
+      <div class="sub">Java 调用 org.lwjgl.opengl.GL11，VM 原生层转到 WebGL</div>
+      <div class="meta" id="meta"></div>
+      <canvas id="gl" width="800" height="500"></canvas>
+      <pre id="out">loading...</pre>
+    </main>
+    <script type="module">
+      import { parseClass } from './jvm.js'
+      import { createVM2 } from './vm2.js'
+
+      const out = document.getElementById('out')
+      const meta = document.getElementById('meta')
+      const canvas = document.getElementById('gl')
+      const gl = canvas.getContext('webgl', { antialias: true })
+
+      const vs = `
+        attribute vec2 pos;
+        attribute vec3 col;
+        varying vec3 vcol;
+        void main() { vcol = col; gl_Position = vec4(pos, 0.0, 1.0); }
+      `
+      const fs = `
+        precision mediump float;
+        varying vec3 vcol;
+        void main() { gl_FragColor = vec4(vcol, 1.0); }
+      `
+      const compile = (type, src) => {
+        const s = gl.createShader(type)
+        gl.shaderSource(s, src)
+        gl.compileShader(s)
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
+        return s
+      }
+      const prog = gl.createProgram()
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs))
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs))
+      gl.linkProgram(prog)
+      gl.useProgram(prog)
+      const posLoc = gl.getAttribLocation(prog, 'pos')
+      const colLoc = gl.getAttribLocation(prog, 'col')
+
+      let bg = [0, 0, 0, 1]
+      let verts = []
+      let cols = []
+      let color = [1, 1, 1]
+
+      const hooks = {
+        clearColor(r, g, b, a) {
+          bg = [r, g, b, a]
+        },
+        clear() {
+          gl.viewport(0, 0, canvas.width, canvas.height)
+          gl.clearColor(bg[0], bg[1], bg[2], bg[3])
+          gl.clear(gl.COLOR_BUFFER_BIT)
+        },
+        begin() {
+          verts = []
+          cols = []
+        },
+        color3f(r, g, b) {
+          color = [r, g, b]
+        },
+        vertex2f(x, y) {
+          verts.push(x, y)
+          cols.push(color[0], color[1], color[2])
+        },
+        end() {
+          if (!verts.length) return
+          const vb = gl.createBuffer()
+          gl.bindBuffer(gl.ARRAY_BUFFER, vb)
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW)
+          gl.enableVertexAttribArray(posLoc)
+          gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0)
+
+          const cb = gl.createBuffer()
+          gl.bindBuffer(gl.ARRAY_BUFFER, cb)
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cols), gl.STATIC_DRAW)
+          gl.enableVertexAttribArray(colLoc)
+          gl.vertexAttribPointer(colLoc, 3, gl.FLOAT, false, 0, 0)
+
+          gl.drawArrays(gl.TRIANGLES, 0, verts.length / 2)
+        },
+      }
+
+      ;(async () => {
+        try {
+          const cls = parseClass(await fetch('./TriangleTest.class').then((r) => r.arrayBuffer()))
+          const vm = createVM2([cls], {}, { gl: hooks })
+          vm.runMain('TriangleTest')
+          meta.innerHTML = '<span>classes <b>1</b></span><span>bridge <b>LWJGL → VM → WebGL</b></span>'
+          out.textContent = 'GL11.glClearColor / glClear / glBegin / glVertex2f / glEnd executed'
+        } catch (e) {
+          out.innerHTML = '<span class="err">' + String(e && e.stack ? e.stack : e) + '</span>'
+        }
+      })()
+    </script>
+  </body>
+</html>
